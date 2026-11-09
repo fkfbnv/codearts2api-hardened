@@ -943,6 +943,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // buildUpstreamMessages 把 OpenAI 消息原生映射为 CodeArts V2 chat-completions。
 // Chat-Id/Session-Id 只做亲和与缓存；多轮语义仍由完整 messages 承载。
+// wireContent 在消息带图片时改用原始分片，纯文本维持原来的字符串。
+func wireContent(m openAIMessage) any {
+	if m.Content != nil {
+		return m.Content
+	}
+	return m.Text
+}
+
 func buildUpstreamMessages(req *chatRequest, toolsOn bool) []upstream.ChatMessage {
 	_ = toolsOn // 保留参数以稳定内部调用面；工具 schema 由 ChatOptions 原生传递。
 	keepCalls, keepResults := pairedToolMessages(req.Messages)
@@ -950,10 +958,10 @@ func buildUpstreamMessages(req *chatRequest, toolsOn bool) []upstream.ChatMessag
 	for i, m := range req.Messages {
 		switch m.Role {
 		case "system", "user":
-			out = append(out, upstream.ChatMessage{Role: m.Role, Content: m.Text})
+			out = append(out, upstream.ChatMessage{Role: m.Role, Content: wireContent(m)})
 		case "assistant":
 			reasoning := m.ReasoningContent
-			wire := upstream.ChatMessage{Role: "assistant", Content: m.Text, ReasoningContent: &reasoning}
+			wire := upstream.ChatMessage{Role: "assistant", Content: wireContent(m), ReasoningContent: &reasoning}
 			if keepCalls[i] {
 				for _, c := range m.ToolCalls {
 					wire.ToolCalls = append(wire.ToolCalls, upstream.ChatToolCall{
@@ -961,7 +969,7 @@ func buildUpstreamMessages(req *chatRequest, toolsOn bool) []upstream.ChatMessag
 						Function: upstream.ChatToolFunction{Name: c.Name, Arguments: c.Arguments},
 					})
 				}
-				if m.Text == "" {
+				if m.Text == "" && m.Content == nil {
 					wire.Content = nil
 				}
 			}

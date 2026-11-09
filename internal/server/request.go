@@ -24,6 +24,7 @@ type openAIToolCall struct {
 type openAIMessage struct {
 	Role             string
 	Text             string
+	Content          any // 含图片时保留原始 OpenAI 分片，纯文本为 nil
 	ReasoningContent string
 	ToolCalls        []openAIToolCall
 	ToolCallID       string // role=tool 时对应的 call id
@@ -120,7 +121,8 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 	return req, nil
 }
 
-// parseMessage 解析单条消息：content 支持 string 与 [{type:text,text}] 分片。
+// parseMessage 解析单条消息：content 支持 string 与 [{type:text,text}] 分片；
+// 带图片分片时额外保留原始线格式，交给上游而不是被拍平成纯文本。
 func parseMessage(rm json.RawMessage) (openAIMessage, error) {
 	var probe struct {
 		Role             string          `json:"role"`
@@ -136,6 +138,7 @@ func parseMessage(rm json.RawMessage) (openAIMessage, error) {
 	m := openAIMessage{
 		Role:             strings.ToLower(strings.TrimSpace(probe.Role)),
 		Text:             flattenContent(probe.Content),
+		Content:          imageContentParts(probe.Content),
 		ReasoningContent: probe.ReasoningContent,
 		ToolCallID:       probe.ToolCallID,
 		Name:             probe.Name,
@@ -182,6 +185,101 @@ func flattenContent(raw json.RawMessage) string {
 		return sb.String()
 	}
 	return ""
+}
+
+// imageContentParts 在 content 含图片时保留原始 OpenAI 分片。
+// 纯文本消息返回 nil，走原来的 Text 路径，避免改动既有行为。
+func imageContentParts(raw json.RawMessage) any {
+	var parts []map[string]any
+	if len(raw) == 0 || string(raw) == "null" || json.Unmarshal(raw, &parts) != nil {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(parts))
+	hasImage := false
+	for _, p := range parts {
+		typ, _ := p["type"].(string)
+		switch typ {
+		case "image_url", "image":
+			img := p["image_url"]
+			if img == nil {
+				img = p["imageUrl"]
+			}
+			if img == nil {
+				img = p["image"]
+			}
+			// ZCode 的图片分片：{"type":"image","mediaType":"image/png","dataUrl":"data:image/png;base64,..."}
+			if img == nil {
+				for _, k := range []string{"dataUrl", "url"} {
+					if s, ok := p[k].(string); ok && s != "" {
+						img = map[string]any{"url": s}
+						break
+					}
+				}
+			}
+			// 裸 base64：data + mediaType/mimeType
+			if img == nil {
+				if data, ok := p["data"].(string); ok && data != "" {
+					mt, _ := p["mediaType"].(string)
+					if mt == "" {
+						mt, _ = p["mimeType"].(string)
+					}
+					if mt == "" {
+						mt = "image/png"
+					}
+					img = map[string]any{"url": "data:" + mt + ";base64," + data}
+				}
+			}
+			// Anthropic 风格：{"type":"image","source":{"type":"base64","media_type":...,"data":...}}
+			// 以及 source 里直接带 dataUrl 的变体。
+			if img == nil {
+				if src, ok := p["source"].(map[string]any); ok {
+					if s, ok := src["dataUrl"].(string); ok && s != "" {
+						img = map[string]any{"url": s}
+					} else if s, ok := src["url"].(string); ok && s != "" {
+						img = map[string]any{"url": s}
+					} else if data, ok := src["data"].(string); ok && data != "" {
+						mt, _ := src["media_type"].(string)
+						if mt == "" {
+							mt, _ = src["mediaType"].(string)
+						}
+						if mt == "" {
+							mt, _ = src["mimeType"].(string)
+						}
+						if mt == "" {
+							mt = "image/png"
+						}
+						img = map[string]any{"url": "data:" + mt + ";base64," + data}
+					}
+				}
+			}
+			if s, ok := img.(string); ok {
+				img = map[string]any{"url": s}
+			}
+			if img == nil {
+				continue
+			}
+			wire := map[string]any{"type": "image_url", "image_url": img}
+			if d, ok := p["detail"].(string); ok {
+				wire["detail"] = d
+			}
+			out = append(out, wire)
+			hasImage = true
+		case "text", "input_text":
+			txt := p["text"]
+			if txt == nil {
+				txt = p["content"]
+			}
+			if txt != nil {
+				out = append(out, map[string]any{"type": "text", "text": txt})
+			}
+		default:
+			out = append(out, p)
+		}
+	}
+	if !hasImage {
+		return nil
+	}
+	return out
 }
 
 // rawJSONString 把 arguments 统一成 JSON 字符串（兼容字符串与对象两种线格式）。
