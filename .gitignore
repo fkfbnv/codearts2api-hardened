@@ -16,3 +16,6 @@ config.json
 !.vscode/launch.json
 !.vscode/tasks.json
 !.vscode/extensions.json
+
+# 本地运行时密钥（勿入库）
+api_key.txt
