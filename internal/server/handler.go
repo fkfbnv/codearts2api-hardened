@@ -469,6 +469,22 @@ func (h *Handler) modelKnownUnusable(model string) bool {
 	return anyKnown && allUnusable
 }
 
+// isJunkModelID 过滤上游模型发现里的脏条目：'speed'（智速模式入口，不可直接调用）
+// 与非 ASCII 的 ID——1107 实测发现过 GBK 误解码产生的乱码条目（「智速模式」的
+// UTF-8 字节被当 GBK 解出的汉字串），这些是合法 UTF-8 但纯属上游展示别名，
+// 混进 /v1/models 会污染客户端选择器。现有真实模型 ID 全部为 ASCII。
+func isJunkModelID(id string) bool {
+	if strings.EqualFold(id, "speed") {
+		return true
+	}
+	for _, r := range id {
+		if r > 0x7F {
+			return true
+		}
+	}
+	return false
+}
+
 // modelEntries 把账号模型目录 + 静态兜底包装成 OpenAI /v1/models 条目。
 //
 // 上游模型 ID 区分大小写：既列精确 ID（GLM-5.2），也补一条小写别名（glm-5.2，
@@ -478,7 +494,7 @@ func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 	out := make([]map[string]any, 0, len(infos)+len(staticModels))
 	seen := map[string]bool{}
 	add := func(id string, ctx, maxOut int64, benefit bool) {
-		if id == "" || seen[id] {
+		if id == "" || seen[id] || isJunkModelID(id) {
 			return
 		}
 		seen[id] = true
