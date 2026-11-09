@@ -21,6 +21,11 @@ func TestUpstreamUnavailableReason(t *testing.T) {
 		{`codearts error code=InferHub.4004.200 msg=benefit not found`, "福利"},
 		{`codearts error code=TM.00001041 msg=并发会话数已达上限`, ""},
 		{`dial tcp: i/o timeout`, ""},
+		// 1109 实测：glm-5.3-flash 走上游网关报 APIG.0101.404，被当 5xx 把单账号池
+		// 冷 10 分钟。它是模型级结论（路由不存在/未发布），绝不能罚账号。
+		{`codearts api code=502 http=502 path=/api/v2/chat/completions msg=InferHub.APIG.0101.404 The API does not exist or has not been published in the environment`, "上游网关"},
+		// 内容审查拒绝不是「模型不可用」——换话题就能用，不能记进可用性缓存。
+		{`codearts api code=502 http=502 msg=InferHub.ModelArts.81011.403 抱歉，我无法提供关于您提问内容的建议。`, ""},
 	}
 	for _, c := range cases {
 		got := upstreamUnavailableReason(errors.New(c.msg))
@@ -48,6 +53,30 @@ func TestAvailabilityCacheScoping(t *testing.T) {
 	markUsable("acct-A", "GLM-5.2")
 	if st, _ := modelAvailability("acct-A", "GLM-5.2"); st != availUsable {
 		t.Error("成功调用后应覆盖为可用")
+	}
+}
+
+// user_id 为空的账号（线上这台就是）以前完全记不进可用性缓存：markUnusable
+// 遇到空 accountID 直接 return，于是 /v1/models 永远列着坏模型，每次调用撞 404。
+func TestAvailabilityWorksForEmptyAccountID(t *testing.T) {
+	markUnusable("", "glm-5.3-flash", "上游网关不可用")
+	if st, reason := modelAvailability("", "glm-5.3-flash"); st != availUnusable || reason == "" {
+		t.Fatalf("空账号 ID 也必须能记录可用性，got state=%v reason=%q", st, reason)
+	}
+	if st, _ := modelAvailability("", "GLM-5.3-Flash"); st != availUnusable {
+		t.Error("空账号 ID 下大小写仍应不敏感")
+	}
+	markUsable("", "glm-5.3-flash")
+	if st, _ := modelAvailability("", "glm-5.3-flash"); st != availUsable {
+		t.Error("空账号 ID 下成功也应覆盖为可用")
+	}
+}
+
+// 空账号 ID 的真实流量同样要记下来，否则后台探测永不避让，会和用户请求抢槽位。
+func TestTrafficRecordedForEmptyAccountID(t *testing.T) {
+	noteTraffic("")
+	if d := trafficIdleFor(""); d > time.Minute {
+		t.Fatalf("空账号 ID 的流量没被记录，idle=%s", d)
 	}
 }
 
@@ -164,5 +193,77 @@ func TestModelErrorDoesNotCoolAccount(t *testing.T) {
 	st, reason := modelAvailability("u-cool", "GLM-5.2-ArkTS-SPARK")
 	if st != availUnusable || reason == "" {
 		t.Errorf("应记为模型不可用，got state=%v reason=%q", st, reason)
+	}
+}
+
+// 1109 实测回归：APIG.0101.404（模型未在环境发布/路由不存在）必须走模型级判据。
+// 修复前它落进 `Status >= 500` 分支，单账号池被冷 10 分钟——调 glm-5.3-flash
+// 之后连刚验证过 200 的 deepseek-v4.1-flash-1017 都变 503。
+func TestAPIG0101DoesNotCoolAccount(t *testing.T) {
+	a := &auth.Auth{UserID: "u-apig", UserName: "u-apig", AccessKeyID: "AK", SecretAccessKey: "SK", CloudDragonTok: "ST"}
+	p, err := pool.New([]*auth.Auth{a}, pool.Config{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second), ErrCooldown: time.Minute, ErrThreshold: 1})
+
+	err502 := &upstream.ApiError{
+		Code: 502, Status: 502, Path: "/api/v2/chat/completions",
+		Message: "InferHub.APIG.0101.404 The API does not exist or has not been published in the environment",
+	}
+	if !h.handleUpstreamError(p.Get("u-apig"), "glm-5.3-flash", err502) {
+		t.Error("APIG.0101 应判为模型级错误，让调用方立即结束轮转")
+	}
+	if !p.Healthy("u-apig") {
+		t.Fatal("APIG.0101 不得冷却账号（否则单账号池整瘫 10 分钟）")
+	}
+	if st, _ := modelAvailability("u-apig", "glm-5.3-flash"); st != availUnusable {
+		t.Error("应记为模型不可用")
+	}
+}
+
+// 内容审查拒绝（81011.403）既不是账号故障也不是模型不可用：换话题就能用。
+func TestContentModerationDoesNotPunishAccount(t *testing.T) {
+	a := &auth.Auth{UserID: "u-mod", UserName: "u-mod", AccessKeyID: "AK", SecretAccessKey: "SK", CloudDragonTok: "ST"}
+	p, err := pool.New([]*auth.Auth{a}, pool.Config{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second), ErrCooldown: time.Minute, ErrThreshold: 1})
+
+	reject := &upstream.ApiError{
+		Code: 502, Status: 502, Path: "/api/v2/chat/completions",
+		Message: "InferHub.ModelArts.81011.403 抱歉，我无法提供关于您提问内容的建议。",
+	}
+	if h.handleUpstreamError(p.Get("u-mod"), "deepseek-v4.1-flash", reject) {
+		t.Error("内容审查不该返回 true（会下架模型）")
+	}
+	if !p.Healthy("u-mod") {
+		t.Fatal("内容审查不得冷却账号")
+	}
+	if st, _ := modelAvailability("u-mod", "deepseek-v4.1-flash"); st == availUnusable {
+		t.Error("内容审查不得把模型记成不可用")
+	}
+	// 阈值 1 的前提下连着被拒几次也不能触发错误累计冷却。
+	for i := 0; i < 3; i++ {
+		h.handleUpstreamError(p.Get("u-mod"), "deepseek-v4.1-flash", reject)
+	}
+	if !p.Healthy("u-mod") {
+		t.Error("连续内容审查拒绝累计后仍不得冷却账号")
+	}
+}
+
+// SSE 正文里的模型级错误（*upstream.UpstreamError）也必须被识别：
+// 修复前它完全绕过 handleUpstreamError，只能靠 NoteError 累计到阈值才炸。
+func TestStreamBodyModelErrorRecognized(t *testing.T) {
+	streamErr := &upstream.UpstreamError{
+		Code: "InferHub.APIG.0101.404",
+		Msg:  "The API does not exist or has not been published in the environment",
+	}
+	if upstreamUnavailableReason(streamErr) == "" {
+		t.Fatal("SSE 正文里的 APIG.0101 应判为模型不可用")
+	}
+	if upstreamUnavailableReasonText(streamErr.Error()) == "" {
+		t.Fatal("正文判据应与错误对象判据一致")
 	}
 }

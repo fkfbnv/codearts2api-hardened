@@ -76,8 +76,23 @@ var availability = struct {
 	lastTraffic map[string]time.Time
 }{byKey: map[string]availEntry{}, probing: map[string]bool{}, lastTraffic: map[string]time.Time{}}
 
+// anonAccountID 用于 user_id 为空的账号。码道的 auths 文件里 user_id 常为空
+// （实测该账号 user_id/user_name 都是空串但完全可用），以前 markUnusable /
+// markUsable 遇到空 ID 直接 return，导致可用性缓存对这类账号彻底失效：
+// /v1/models 会把坏模型一直列着，每次调用都撞一遍 404。单账号部署下用固定
+// 哨兵值即可正确归并——多账号部署的 user_id 都不会为空。
+const anonAccountID = "\x00anon"
+
+// keyAccountID 把空账号 ID 归一成哨兵值，避免可用性缓存静默失效。
+func keyAccountID(accountID string) string {
+	if accountID == "" {
+		return anonAccountID
+	}
+	return accountID
+}
+
 func availKey(accountID, model string) string {
-	return accountID + "|" + strings.ToLower(model)
+	return keyAccountID(accountID) + "|" + strings.ToLower(model)
 }
 
 // modelAvailability 返回缓存的可用性；过期视为未知。
@@ -93,7 +108,7 @@ func modelAvailability(accountID, model string) (availState, string) {
 
 // markUnusable 记录某账号下某模型不可用（来自探测或真实请求失败）。
 func markUnusable(accountID, model, reason string) {
-	if accountID == "" || model == "" {
+	if model == "" {
 		return
 	}
 	availability.Lock()
@@ -103,7 +118,7 @@ func markUnusable(accountID, model, reason string) {
 
 // markUsable 记录某账号下某模型可用。
 func markUsable(accountID, model string) {
-	if accountID == "" || model == "" {
+	if model == "" {
 		return
 	}
 	availability.Lock()
@@ -113,19 +128,16 @@ func markUsable(accountID, model string) {
 
 // noteTraffic 记录账号上一次真实请求时间（探测据此避让）。
 func noteTraffic(accountID string) {
-	if accountID == "" {
-		return
-	}
 	availability.Lock()
 	defer availability.Unlock()
-	availability.lastTraffic[accountID] = time.Now()
+	availability.lastTraffic[keyAccountID(accountID)] = time.Now()
 }
 
 // trafficIdleFor 返回账号距上次真实请求的空闲时长；从未有流量返回极大值。
 func trafficIdleFor(accountID string) time.Duration {
 	availability.Lock()
 	defer availability.Unlock()
-	t, ok := availability.lastTraffic[accountID]
+	t, ok := availability.lastTraffic[keyAccountID(accountID)]
 	if !ok {
 		return time.Duration(1<<62 - 1)
 	}
@@ -143,6 +155,15 @@ func upstreamUnavailableReason(err error) string {
 		return "模型未在当前账号注册"
 	case strings.Contains(msg, "4004.200") || strings.Contains(msg, "benefit not found"):
 		return "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
+	case strings.Contains(msg, "000010051") || strings.Contains(msg, "无权调用该模型"):
+		// TM.000010051 是模型级错误（企业侧未开通该模型），换账号结果相同；
+		// 绝不能落到 5xx 分支把健康账号冷却 10 分钟（1107 实测单账号池整瘫）。
+		return "账号无权调用该模型（企业侧未开通）"
+	case strings.Contains(msg, "apig.0101") || strings.Contains(msg, "api does not exist or has not been published"):
+		// APIG.0101.404 出现在这里有两个来源：该模型没在本账号环境发布、或上游
+		// 网关把「模型路由不存在」包装成 502。两种都是模型级结论，换账号不会变；
+		// 1109 实测：调 glm-5.3-flash 拿到它 → 被当 5xx → 单账号池整瘫 10 分钟。
+		return "模型在上游网关上不可用（未发布或路由不存在）"
 	}
 	return ""
 }
@@ -235,6 +256,10 @@ func upstreamUnavailableReasonText(s string) string {
 		return "模型未在当前账号注册"
 	case strings.Contains(low, "4004.200") || strings.Contains(low, "benefit not found"):
 		return "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
+	case strings.Contains(low, "000010051") || strings.Contains(low, "无权调用该模型"):
+		return "账号无权调用该模型（企业侧未开通）"
+	case strings.Contains(low, "apig.0101") || strings.Contains(low, "api does not exist or has not been published"):
+		return "模型在上游网关上不可用（未发布或路由不存在）"
 	}
 	return ""
 }

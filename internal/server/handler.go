@@ -849,6 +849,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					"upstream rejected request params: "+truncateMsg(serr.Error(), 200))
 				return
 			}
+			if isContentModerationError(serr) {
+				// 上游内容审查拒绝：换账号、换措辞都未必过，但它是针对本次内容的
+				// 结论，不是账号故障。直接回 400 让客户端看到真实原因，别再让整池
+				// 陪跑 10 分钟冷却（1109 实测 81011.403 被当 5xx）。
+				h.handleUpstreamError(acct, model, serr) // 只记日志，不动账号
+				writeOpenAIError(w, http.StatusBadRequest, "content_filter",
+					"upstream content moderation rejected this request: "+truncateMsg(serr.Error(), 200))
+				return
+			}
 			lastErr = serr
 			if h.handleUpstreamError(acct, model, serr) {
 				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
@@ -889,7 +898,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 			if werr != nil {
 				log.Printf("chat stream account=%s error: %v", acct.Name, werr)
-				if !isParamInvalidError(werr) {
+				// 流式响应头已经发出去了，没法再回 404；但必须把「这个模型对这个
+				// 账号不可用」记进可用性缓存，否则错误会累计到阈值把账号冷却——
+				// 上游把模型级错误塞进 200 的 SSE 正文（如 APIG.0101）时正是这条路。
+				if reason := upstreamUnavailableReason(werr); reason != "" {
+					markUnusable(acct.UID, model, reason)
+					log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
+				} else if !isParamInvalidError(werr) {
 					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 				}
 			} else {
@@ -908,7 +923,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			lastErr = aerr
-			h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, aerr.Error())
+			// 这里以前是「任何聚合错误一律冷却账号」。上游会把模型级错误（未注册 /
+			// 未开通 / 福利过期 / APIG.0101 路由不存在）塞在 200 的 SSE 正文里，
+			// 于是点一个坏模型就把单账号池冷 10 分钟（1109 glm-5.3-flash 实测）。
+			// 统一走 handleUpstreamError 分类，和流式路径保持同一套判据。
+			if h.handleUpstreamError(acct, model, aerr) {
+				writeOpenAIError(w, http.StatusNotFound, "model_not_available",
+					"model "+model+" is not available: "+truncateMsg(aerr.Error(), 200))
+				return
+			}
 			continue
 		}
 
@@ -1128,17 +1151,26 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 	if isParamInvalidError(err) {
 		return false
 	}
+	// 「模型对这个账号不可用」是账号能力问题，不是账号故障，必须在状态码分支
+	// **之前**判断：这类错误会被上游包装成 5xx / 塞进 200 的 SSE 正文，落到
+	// 下面的 `ae.Status >= 500` 或 NoteError 阈值就把健康账号冷却 10 分钟——
+	// 实测调用一个未注册模型，整个账号被冷却，后续正常请求全部失败。
+	// 判据放在 ApiError 分支之外：SSE 正文里的错误是 *upstream.UpstreamError，
+	// 以前完全绕过这里，只能靠 NoteError 累计到阈值才炸（1109 实测）。
+	if reason := upstreamUnavailableReason(err); reason != "" {
+		markUnusable(acct.UID, model, reason)
+		log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
+		return true
+	}
+	// 内容审查拒绝同样不是账号故障，但它也不是「模型不可用」——换个话题请求就能
+	// 成功，所以只告诉客户端被拒，不动账号状态。
+	if isContentModerationError(err) {
+		log.Printf("upstream content moderation reject account=%s model=%s msg=%s",
+			acct.Name, model, truncateMsg(err.Error(), 120))
+		return false
+	}
 	var ae *upstream.ApiError
 	if errors.As(err, &ae) {
-		// 「模型对这个账号不可用」是账号能力问题，不是账号故障，必须在状态码分支
-		// **之前**判断：not registered / benefit not found 会被嵌入错误包装成
-		// 5xx，落到下面的 `ae.Status >= 500` 就把健康账号冷却 10 分钟——实测
-		// 调用一个未注册模型，整个账号被冷却，后续正常请求全部失败。
-		if reason := upstreamUnavailableReason(err); reason != "" {
-			markUnusable(acct.UID, model, reason)
-			log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
-			return true
-		}
 		switch {
 		case ae.Status == 401 || ae.Code == 401:
 			h.cfg.Pool.Disable(acct.Name, "401 "+ae.Message)
@@ -1157,6 +1189,22 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 	}
 	h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 	return false
+}
+
+// isContentModerationError 判断是否为上游的内容审查拒绝（InferHub.ModelArts.81011.403）。
+//
+// 这类响应是「这次请求的内容我不答」，跟账号健康、跟模型能力都无关：换账号逐字
+// 重放同一段内容，上游还是拒。上游把它包成 502，于是落到 `ae.Status >= 500`
+// 分支把单账号池冷 10 分钟——1109 实测长中文/敏感话题一句话就能打掉整池。
+// 正确处理是直接把拒绝原因回给客户端，不罚账号、不记模型不可用。
+func isContentModerationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	low := strings.ToLower(err.Error())
+	return strings.Contains(low, "modelarts.81011") ||
+		strings.Contains(low, "inferhub.modelarts.81011") ||
+		strings.Contains(low, "抱歉，我无法提供关于您提问内容的建议")
 }
 
 // isParamInvalidError 判断是否为上游「请求参数无效」类错误（InferHub.001001005）。
