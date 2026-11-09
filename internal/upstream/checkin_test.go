@@ -41,8 +41,12 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 				}
 				w.Header().Set("Content-Type", "application/json")
 				if r.Method == http.MethodGet {
-					if r.URL.Path != EpCreditDelivery || r.URL.Query().Get("channel") != "IDE" {
+					// 2026-11-02 起双通道轮询：IDE 与 PORTAL 各查一次。
+					if r.URL.Path != EpCreditDelivery {
 						t.Errorf("wrong delivery URL: %s", r.URL)
+					}
+					if ch := r.URL.Query().Get("channel"); ch != "IDE" && ch != "PORTAL" {
+						t.Errorf("unexpected delivery channel: %s", r.URL)
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"items": []any{
 						map[string]any{"campaignId": 1, "title": "daily", "status": tc.status, "claimable": tc.claimable, "benefitUnit": "CREDIT", "benefitAmount": 1000, "pendingTotalAmount": 1000, "extra": map[string]string{"endTime": tc.end, "startTime": tc.start}},
@@ -61,7 +65,8 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 				}
 				if r.URL.Path == EpCreditClaim {
 					key, _ := body["idempotentKey"].(string)
-					if body["channel"] != "IDE" || !strings.HasPrefix(key, "claim_1_") {
+					// 同 ID 双通道并集时 PORTAL 覆盖 IDE，claim 用来源通道。
+					if body["channel"] != "PORTAL" || !strings.HasPrefix(key, "claim_1_") {
 						t.Errorf("wrong claim body: %v", body)
 					}
 				}
@@ -131,7 +136,8 @@ func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
 		{name: "claim business failure", claim: `{"code":40001,"message":"not ready"}`},
 		{name: "claim missing code", claim: `{"message":"ok"}`},
 		{name: "empty campaigns", delivery: `{"code":0,"data":{"items":[]}}`, wantOK: true},
-		{name: "missing items", delivery: `{"code":0,"data":{}}`, wantErr: true},
+		// 2026-11-02 双通道语义：两通道都拿不到 items 只是「无活动」，不再视为故障。
+		{name: "missing items", delivery: `{"code":0,"data":{}}`, wantOK: true},
 		{name: "missing business code", delivery: `{"data":{"items":[]}}`, wantErr: true},
 		{name: "delivery business failure", delivery: `{"code":40001,"message":"not ready"}`, wantErr: true},
 	}

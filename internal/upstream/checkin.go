@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -17,6 +18,11 @@ const (
 	EpCreditConfirm  = "/v1/ops/confirm"
 	creditChannel    = "IDE"
 )
+
+// creditChannels 2026-11-02：新积分体系的「每日签到领100积分」投放在 PORTAL 通道，
+// IDE 通道只见老活动（1030 上线时实测三次轮询均只领到新用户 4000）。
+// delivery 轮询双通道并集，claim 按活动来源通道发送。
+var creditChannels = []string{"IDE", "PORTAL"}
 
 // CreditCampaign 是活动投放接口的脱敏条目；不保留 access 中的活动票据。
 type CreditCampaign struct {
@@ -31,6 +37,9 @@ type CreditCampaign struct {
 		StartTime string `json:"startTime"`
 		EndTime   string `json:"endTime"`
 	} `json:"extra"`
+
+	// Channel 该条目来自哪个投放通道（不序列化），claim 时原样带回。
+	Channel string `json:"-"`
 }
 
 type CreditClaimResult struct {
@@ -97,21 +106,53 @@ func (c *Client) creditRequest(ctx context.Context, method, path string, body an
 }
 
 // FetchCreditCampaigns 只读查询活动，端点位于 snap 根路径而非 snap-manager。
+// 2026-11-02 起轮询双通道（IDE+PORTAL）并集；PORTAL 覆盖同 ID 的 IDE 条目，
+// 单通道失败不阻断（新体系活动只在 PORTAL 投放时 IDE 仍可用），两通道全失败才报错。
 func (c *Client) FetchCreditCampaigns(ctx context.Context, cred SignCredential) ([]CreditCampaign, error) {
-	raw, err := c.creditRequest(ctx, http.MethodGet, EpCreditDelivery+"?channel="+creditChannel, nil, cred)
-	if err != nil {
-		return nil, err
+	merged := make(map[int]CreditCampaign)
+	var firstErr error
+	for _, ch := range creditChannels {
+		raw, err := c.creditRequest(ctx, http.MethodGet, EpCreditDelivery+"?channel="+ch, nil, cred)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		var data struct {
+			Items *[]CreditCampaign `json:"items"`
+		}
+		if err := json.Unmarshal(raw, &data); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("parse credit campaigns(%s): %w", ch, err)
+			}
+			continue
+		}
+		if data.Items == nil {
+			continue
+		}
+		for _, camp := range *data.Items {
+			camp.Channel = ch
+			merged[camp.ID] = camp
+		}
 	}
-	var data struct {
-		Items *[]CreditCampaign `json:"items"`
+	if len(merged) == 0 && firstErr != nil {
+		return nil, firstErr
 	}
-	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, fmt.Errorf("parse credit campaigns: %w", err)
+	out := make([]CreditCampaign, 0, len(merged))
+	for _, camp := range merged {
+		out = append(out, camp)
 	}
-	if data.Items == nil {
-		return nil, fmt.Errorf("credit activity response missing data.items")
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// claimChannel 返回该活动领取时应使用的投放通道。
+func (camp CreditCampaign) claimChannel() string {
+	if camp.Channel != "" {
+		return camp.Channel
 	}
-	return *data.Items, nil
+	return creditChannel
 }
 
 // Checkin 领取每日签到（1）和新用户（4）积分。上游决定资格和每日刷新，
@@ -123,7 +164,8 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 	}
 	out := CheckinResult{OK: true, Campaigns: make([]CreditClaimResult, 0)}
 	for _, campaign := range campaigns {
-		if campaign.ID != 1 && campaign.ID != 4 {
+		// 2026-11-02：新体系每日活动换了 ID（标题含「签到」），一并纳入。
+		if campaign.ID != 1 && campaign.ID != 4 && !strings.Contains(campaign.Title, "签到") {
 			continue
 		}
 		if campaign.BenefitUnit != "" && campaign.BenefitUnit != "CREDIT" {
@@ -170,7 +212,7 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 			return res
 		}
 		_, err := c.creditRequest(ctx, http.MethodPost, EpCreditClaim, map[string]any{
-			"campaignId": campaign.ID, "channel": creditChannel,
+			"campaignId": campaign.ID, "channel": campaign.claimChannel(),
 			"idempotentKey": fmt.Sprintf("claim_%d_%d", campaign.ID, now.UnixMilli()),
 		}, cred)
 		if err != nil {
