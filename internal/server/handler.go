@@ -86,7 +86,7 @@ const (
 	modelsFetchFailCooldown = 5 * time.Minute
 )
 
-const maxBodyBytes = 8 << 20
+const maxBodyBytes = 32 << 20
 
 // Handler 主路由。
 type Handler struct {
@@ -662,7 +662,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(body) > maxBodyBytes {
-		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 8MB limit")
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 32MB limit")
 		return
 	}
 	req, err := parseChatRequest(body)
