@@ -26,6 +26,8 @@ func main() {
 	agentType := flag.String("agent-type", "PromptCenter", "Agent-Type header (old endpoint requires it)")
 	mode := flag.String("mode", "legacy", "legacy (old endpoint) or v2")
 	benefit := flag.Bool("benefit", false, "send maas_type: benefit (v2 mode)")
+	agentID := flag.String("agent-id", "", "agent_id to include in v2 body")
+	client := flag.String("client", "", "client/task fields (IDE)")
 	flag.Parse()
 
 	auths, err := auth.LoadDir(*authDir)
@@ -86,6 +88,15 @@ func main() {
 		}
 		if *user != "" {
 			v2["user_id"] = *user
+		}
+		if *agentID != "" {
+			v2["agent_id"] = *agentID
+		}
+		if *client != "" {
+			v2["client"] = *client
+			v2["task"] = "chat"
+			v2["not_allow_external_model"] = true
+			v2["task_parameters"] = map[string]any{"ide": "CodeArts Agent"}
 		}
 		rc, err2 = c.SendChatV2(ctx, v2, "diag", cred, acct.CloudDragonTok, *benefit)
 	} else {
