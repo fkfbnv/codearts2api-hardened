@@ -847,3 +847,49 @@ func (c *Client) SendChatLegacy(ctx context.Context, body map[string]any, traceI
 	}
 	return resp.Body, nil
 }
+
+// SendChatV2OT 同 SendChatV2，但在签名之后追加 OpenThrottle 会话头
+// （x-ot-session-id / user-session-id / x-ot-trace-id）。
+//
+// 来源：clii2api / WorkBuddy tip 28527f4、hub #723 —— 网关用 x-ot-session-id
+// 统计并发会话，且这些头必须在 signRequest 之后设置（进 SignedHeaders 会被拒）。
+// 2026-11-11 排查「直调 TM.000010051」时加入：CLI 内部带这套头，直调没带。
+func (c *Client) SendChatV2OT(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, userID string, benefit bool) (io.ReadCloser, error) {
+	raw, _ := json.Marshal(body)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatEndpoint(), bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range ChatHeadersV2(userToken, traceID, "zh-cn") {
+		httpReq.Header.Set(k, v)
+	}
+	if benefit {
+		httpReq.Header.Set(HeaderMaasType, MaasBenefit)
+	}
+	signRequest(httpReq, raw, cred)
+	// 签名之后追加，保持它们不在 SignedHeaders 里。
+	sum := sha256.Sum256([]byte("codearts-ot-session:" + userID))
+	sid := hex.EncodeToString(sum[:16])
+	httpReq.Header.Set("x-ot-session-id", sid)
+	httpReq.Header.Set("user-session-id", sid)
+	httpReq.Header.Set("x-ot-trace-id", randHexN(16))
+	resp, err := c.streamHTTP.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(rawBody), 300), Path: c.chatEndpoint()}
+	}
+	return preflightSSE(resp.Body)
+}
+
+// randHexN 生成 n 字节的十六进制串。
+func randHexN(n int) string {
+	buf := make([]byte, n)
+	if _, err := crand.Read(buf); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
+}

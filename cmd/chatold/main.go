@@ -28,6 +28,7 @@ func main() {
 	mode := flag.String("mode", "legacy", "legacy (old endpoint) or v2")
 	benefit := flag.Bool("benefit", false, "send maas_type: benefit (v2 mode)")
 	agentID := flag.String("agent-id", "", "agent_id to include in v2 body")
+	otUID := flag.String("ot-uid", "", "OpenThrottle session user id (adds x-ot-session-id/user-session-id)")
 	client := flag.String("client", "", "client/task fields (IDE)")
 	flag.Parse()
 
@@ -109,7 +110,11 @@ func main() {
 			v2["not_allow_external_model"] = true
 			v2["task_parameters"] = map[string]any{"ide": "CodeArts Agent"}
 		}
-		rc, err2 = c.SendChatV2(ctx, v2, "diag", cred, tok, *benefit)
+		if *otUID != "" {
+			rc, err2 = c.SendChatV2OT(ctx, v2, "diag", cred, tok, *otUID, *benefit)
+		} else {
+			rc, err2 = c.SendChatV2(ctx, v2, "diag", cred, tok, *benefit)
+		}
 	} else {
 		rc, err2 = c.SendChatLegacy(ctx, body, "diag", cred, acct.CloudDragonTok, *agentType)
 	}

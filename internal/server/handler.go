@@ -1471,6 +1471,13 @@ func (h *Handler) cliModelFor(model string) (string, bool) {
 func (h *Handler) chatViaCLI(w http.ResponseWriter, r *http.Request, req *chatRequest, cliModel, affinity string) {
 	convID := conversationIDFor(req, affinity)
 	prompt := promptFromMessages(req.Messages)
+	// 带工具时：CLI 是 agent 内核、不返回 OpenAI tool_calls，因此按官方对 DSML
+	// 模型的做法把工具 schema 注入 prompt，要求模型输出 ```tool_call 代码块，
+	// 再由 toolResponse 解析成标准 tool_calls。
+	toolsOn := len(req.Tools) > 0 && req.ToolChoice.Mode != "none"
+	if toolsOn {
+		prompt = toolPrompt(prompt, req.Tools, req.ToolChoice)
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 300*time.Second)
 	defer cancel()
 
@@ -1492,109 +1499,25 @@ func (h *Handler) chatViaCLI(w http.ResponseWriter, r *http.Request, req *chatRe
 		chatID = randHex(32)
 	}
 	w.Header().Set("X-Codearts-Chat-Id", chatID)
+
+	content := res.Text
+	finish := "stop"
+	var calls []openAIToolCall
+	if toolsOn {
+		if c, rest, found := toolResponse(res.Text); found {
+			calls = c
+			content = rest
+			finish = "tool_calls"
+			assignCallIDs(calls)
+		}
+	}
 	if req.Stream {
-		streamCLIText(w, req.Model, res.Text)
-		return
-	}
-	writeJSON(w, http.StatusOK, buildCompletion(req.Model, "", res.Text, nil, "stop", chatID, usageEstimateText(prompt, res.Text)))
-}
-
-// promptFromMessages 把 OpenAI 消息序列拍成 CLI 能理解的单段 prompt。
-// CLI 自己维护会话历史（同一 conversation 复用 session），这里保留角色标记，
-// 便于模型区分系统指令/历史/工具结果。
-func promptFromMessages(msgs []openAIMessage) string {
-	var sb strings.Builder
-	for _, m := range msgs {
-		if m.Text == "" && len(m.ToolCalls) == 0 {
-			continue
-		}
-		switch m.Role {
-		case "system":
-			sb.WriteString("[系统]\n")
-		case "assistant":
-			sb.WriteString("[助手]\n")
-		case "tool":
-			sb.WriteString("[工具结果]\n")
-		default:
-			sb.WriteString("[用户]\n")
-		}
-		if m.Text != "" {
-			sb.WriteString(m.Text)
-			if !strings.HasSuffix(m.Text, "\n") {
-				sb.WriteString("\n")
-			}
-		}
-		for _, c := range m.ToolCalls {
-			sb.WriteString("调用工具 " + c.Name + "(" + c.Arguments + ")\n")
-		}
-		sb.WriteString("\n")
-	}
-	return sb.String()
-}
-
-// streamCLIText 把完整文本按块伪流式返回（CLI 不提供增量事件给这条路径）。
-func streamCLIText(w http.ResponseWriter, model, text string) {
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("Connection", "keep-alive")
-	h.Set("X-Accel-Buffering", "no")
-	fl, _ := w.(http.Flusher)
-	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
-
-	send := func(delta map[string]any, fin string) bool {
-		choice := map[string]any{"index": 0, "delta": delta}
-		if fin != "" {
-			choice["finish_reason"] = fin
-		}
-		chunk := map[string]any{
-			"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(),
-			"model": model, "choices": []any{choice},
-		}
-		raw, _ := json.Marshal(chunk)
-		if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
-			return false
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return true
-	}
-
-	if !send(map[string]any{"role": "assistant"}, "") {
-		return
-	}
-	runes := []rune(text)
-	const step = 32
-	for i := 0; i < len(runes); i += step {
-		end := i + step
-		if end > len(runes) {
-			end = len(runes)
-		}
-		if !send(map[string]any{"content": string(runes[i:end])}, "") {
+		if len(calls) > 0 {
+			streamCLIToolCalls(w, req.Model, calls)
 			return
 		}
+		streamCLIText(w, req.Model, content)
+		return
 	}
-	send(map[string]any{}, "stop")
-	_, _ = io.WriteString(w, "data: [DONE]\n\n")
-	if fl != nil {
-		fl.Flush()
-	}
-}
-
-// usageEstimateText 粗略估算 token（CLI 路径拿不到可信 usage）。
-func usageEstimateText(prompt, out string) map[string]any {
-	pt := len([]rune(prompt)) / 2
-	if pt < 1 {
-		pt = 1
-	}
-	ot := len([]rune(out)) / 2
-	if ot < 1 {
-		ot = 1
-	}
-	return map[string]any{
-		"prompt_tokens":     pt,
-		"completion_tokens": ot,
-		"total_tokens":      pt + ot,
-	}
+	writeJSON(w, http.StatusOK, buildCompletion(req.Model, "", content, calls, finish, chatID, usageEstimateText(prompt, res.Text)))
 }
