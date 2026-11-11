@@ -817,3 +817,33 @@ func (c *Client) getSigned(ctx context.Context, urlStr string, cred SignCredenti
 	}
 	return raw, nil
 }
+
+// SendChatLegacy 用官方 IDE 的旧聊天端点（/v1/chat/chat）发送，并附加
+// Agent-Type 头（旧端点校验该头，缺失回 TM.00001001「请求头Agent-Type为空」）。
+//
+// 仅用于诊断/兼容：新端点 /api/v2/chat/completions 不校验 Agent-Type，
+// 但旧端点的模型权限范围可能不同（2026-11-11 排查「网页可用、反代无权」时加入）。
+func (c *Client) SendChatLegacy(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, agentType string) (io.ReadCloser, error) {
+	raw, _ := json.Marshal(body)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatEndpoint(), bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range ChatHeadersV2(userToken, traceID, "zh-cn") {
+		httpReq.Header.Set(k, v)
+	}
+	if agentType != "" {
+		httpReq.Header.Set("Agent-Type", agentType)
+	}
+	signRequest(httpReq, raw, cred)
+	resp, err := c.streamHTTP.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(rawBody), 300), Path: c.chatEndpoint()}
+	}
+	return resp.Body, nil
+}
