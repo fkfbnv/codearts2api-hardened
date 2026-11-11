@@ -33,8 +33,28 @@ func TestStreamStopsReadingAfterDone(t *testing.T) {
 	}
 }
 
-func TestStreamReturnsEmbeddedErrorAfterWritingTerminalEvent(t *testing.T) {
+// 首帧就是错误、且尚未向客户端写出任何内容：返回 PreStreamError，让 handler
+// 能回真正的 JSON 错误（状态码正确），而不是 200 + SSE error 事件。
+func TestStreamReturnsPreStreamErrorBeforeAnyOutput(t *testing.T) {
 	stream := strings.NewReader("event: done\ndata: {\"error_code\":\"quota.429\",\"error_msg\":\"quota exceeded\"}\n\n")
+	rec := httptest.NewRecorder()
+	err := Stream(rec, stream, "glm-5.2")
+	if err == nil || !strings.Contains(err.Error(), "quota exceeded") {
+		t.Fatalf("embedded upstream error was reported as success: %v", err)
+	}
+	var pre *PreStreamError
+	if !errors.As(err, &pre) {
+		t.Fatalf("first-frame error should be PreStreamError, got %T", err)
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("pre-stream error must not write SSE body, got: %s", body)
+	}
+}
+
+// 已经写出内容后才收到错误：头已发出，只能走 SSE error 事件 + [DONE]。
+func TestStreamWritesErrorEventAfterContent(t *testing.T) {
+	stream := strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+		"event: done\ndata: {\"error_code\":\"quota.429\",\"error_msg\":\"quota exceeded\"}\n\n")
 	rec := httptest.NewRecorder()
 	err := Stream(rec, stream, "glm-5.2")
 	if err == nil || !strings.Contains(err.Error(), "quota exceeded") {

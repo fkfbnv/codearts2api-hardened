@@ -35,6 +35,15 @@ func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("codearts error: %s", e.Msg)
 }
 
+// PreStreamError 表示上游在吐出任何内容之前就报错，此时 HTTP 响应头还没真正
+// 写出（Content-Type 只是 Set，尚未 WriteHeader）。handler 据此可以回一个真正的
+// JSON 错误（带正确状态码），而不是 200 + SSE error 事件——后者会让客户端把
+// 「模型不存在/参数非法」当成一次成功的流式响应的中途失败，重试逻辑全乱。
+type PreStreamError struct{ Err error }
+
+func (e *PreStreamError) Error() string { return e.Err.Error() }
+func (e *PreStreamError) Unwrap() error { return e.Err }
+
 // RawCompletion 聚合结果。
 type RawCompletion struct {
 	Content   string
@@ -483,6 +492,9 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 	br := bufio.NewReaderSize(r, 64*1024)
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	sawDone := false
+	// wroteAny 表示已经向客户端写出过任何字节。只有还没写时，首帧错误才能升级成
+	// 真正的 HTTP 错误（见 PreStreamError）。
+	wroteAny := false
 	var (
 		content   strings.Builder
 		reason    strings.Builder
@@ -515,6 +527,7 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
 			return err
 		}
+		wroteAny = true
 		if fl != nil {
 			fl.Flush()
 		}
@@ -534,6 +547,7 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
 			return err
 		}
+		wroteAny = true
 		if fl != nil {
 			fl.Flush()
 		}
@@ -545,6 +559,7 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		if _, err := io.WriteString(w, "event: error\n"+"data: "+string(raw)+"\n\n"); err != nil {
 			return err
 		}
+		wroteAny = true
 		if fl != nil {
 			fl.Flush()
 		}
@@ -579,6 +594,11 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			beforeContent, beforeReason := content.Len(), reason.Len()
 			applyEvent(&content, &reason, &finish, &upErr, ev, data)
 			if upErr != nil {
+				// 首帧就是错误、且还没向客户端写出任何内容：交给 handler 回真正的
+				// JSON 错误（正确状态码），不要伪装成 200 的 SSE 流。
+				if !wroteAny {
+					return &PreStreamError{Err: upErr}
+				}
 				if werr := writeErr(upErr.Error()); werr != nil {
 					streamErr = werr
 					break

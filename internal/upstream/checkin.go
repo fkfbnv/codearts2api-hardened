@@ -33,9 +33,15 @@ type CreditCampaign struct {
 	BenefitUnit        string  `json:"benefitUnit"`
 	BenefitAmount      float64 `json:"benefitAmount"`
 	PendingTotalAmount float64 `json:"pendingTotalAmount"`
-	Extra              struct {
+	// Type 活动类型（上游用 USER_LOGIN 标识每日签到）。campaignId 会随活动
+	// 轮换而变化（1102 是 1，1111 已换号），按类型定位才稳。
+	Type  string `json:"type"`
+	Extra struct {
 		StartTime string `json:"startTime"`
 		EndTime   string `json:"endTime"`
+		// TriggerEvent 与 Type 等价的触发事件标识（如 user.login）。
+		TriggerEvent string `json:"triggerEvent"`
+		Type         string `json:"type"`
 	} `json:"extra"`
 
 	// Channel 该条目来自哪个投放通道（不序列化），claim 时原样带回。
@@ -155,8 +161,34 @@ func (camp CreditCampaign) claimChannel() string {
 	return creditChannel
 }
 
-// Checkin 领取每日签到（1）和新用户（4）积分。上游决定资格和每日刷新，
-// 已领取不再 claim；CLAIMED 只补 confirm。调用方应串行化同一账号的领取。
+// isClaimableCreditCampaign 判断某活动是否属于「签到 / 新手」类，需要领取。
+//
+// 2026-11-11 改为按活动类型定位：campaignId 会随活动轮换（1102 每日签到是 1，
+// 1111 已变成 34），按 ID 匹配会静默失效。实测 delivery 返回：
+//
+//	34 每日签到领150积分      type=USER_LOGIN
+//	40 Skill创新赛每日签到礼  type=USER_LOGIN
+//	42 Skill创新赛报名礼      type=USER_LOGIN（2000 分，标题不含「签到」）
+//	4  新用户注册送 4000 积分 type=NEW_USER_REGISTER
+//
+// 旧判据（ID 1/4 或标题含「签到」）会漏掉 42 这类一次性礼包。
+// 学生认证(STUDENT_CERTIFIED) / 邀请(INVITE_USER) 不在此列：它们不是签到。
+func isClaimableCreditCampaign(camp CreditCampaign) bool {
+	typ := strings.ToUpper(strings.TrimSpace(firstNonEmpty(camp.Type, camp.Extra.Type)))
+	switch typ {
+	case "USER_LOGIN", "NEW_USER_REGISTER":
+		return true
+	}
+	// 兼容上游没返回 type 的情况（老版本接口）：保留原判据作兜底。
+	if camp.ID == 4 || camp.ID == 1 || strings.Contains(camp.Title, "签到") {
+		return true
+	}
+	return false
+}
+
+// Checkin 领取每日签到（USER_LOGIN）和新用户（NEW_USER_REGISTER）积分。
+// 上游决定资格和每日刷新，已领取不再 claim；CLAIMED 只补 confirm。
+// 调用方应串行化同一账号的领取。
 func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResult, error) {
 	campaigns, err := c.FetchCreditCampaigns(ctx, cred)
 	if err != nil {
@@ -164,8 +196,7 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 	}
 	out := CheckinResult{OK: true, Campaigns: make([]CreditClaimResult, 0)}
 	for _, campaign := range campaigns {
-		// 2026-11-02：新体系每日活动换了 ID（标题含「签到」），一并纳入。
-		if campaign.ID != 1 && campaign.ID != 4 && !strings.Contains(campaign.Title, "签到") {
+		if !isClaimableCreditCampaign(campaign) {
 			continue
 		}
 		if campaign.BenefitUnit != "" && campaign.BenefitUnit != "CREDIT" {

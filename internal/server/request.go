@@ -13,6 +13,10 @@ import (
 	"strings"
 )
 
+// MaxUpstreamOutputTokens 上游 InferHub 接受的 max_tokens 上限。
+// 超过即 InferHub.001001005.400（2026-11 多个第三方实现一致实测）。
+const MaxUpstreamOutputTokens = 65536
+
 // openAIToolCall 一次函数调用（assistant 历史或响应里用）。
 type openAIToolCall struct {
 	ID        string `json:"id"`
@@ -93,6 +97,15 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 	}
 	if req.MaxTokens != nil && *req.MaxTokens <= 0 {
 		return nil, errors.New("max_tokens must be greater than 0")
+	}
+	// 上游实测输出上限 65536，超过即 InferHub.001001005.400「param is invalid」。
+	// 客户端（含 opencode 之类）常传 131072/262144，直接透传会让一次普通请求
+	// 变成参数错误。这里统一封顶，而不是回 400：封顶后请求能正常完成。
+	// 另外上游只认 max_tokens，不认 max_completion_tokens——后者已在上面折叠
+	// 进 MaxTokens，发往上游的 body 里不会出现（见 client.go chatBodyV2）。
+	if req.MaxTokens != nil && *req.MaxTokens > MaxUpstreamOutputTokens {
+		v := MaxUpstreamOutputTokens
+		req.MaxTokens = &v
 	}
 	if req.Temperature != nil && (*req.Temperature < 0 || *req.Temperature > 2) {
 		return nil, errors.New("temperature must be between 0 and 2")

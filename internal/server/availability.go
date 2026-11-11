@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"errors"
 	"log"
 	"strings"
 	"sync"
@@ -144,28 +145,169 @@ func trafficIdleFor(accountID string) time.Duration {
 	return time.Since(t)
 }
 
-// upstreamUnavailableReason 把上游错误归类为「该模型对这个账号不可用」，否则返回空串。
-func upstreamUnavailableReason(err error) string {
+// ---------------------------------------------------------------------------
+// 上游错误分类
+// ---------------------------------------------------------------------------
+//
+// 这套服务最容易出事的地方不是协议转换，而是「错误归谁」：把模型级/请求级
+// 错误当成账号故障，单账号池就会整池冷却甚至永久禁用。两次真实事故：
+//   - 1109 glm-5.3-flash 的 APIG.0101 落进 5xx 分支 → 整池冷却 10 分钟
+//   - 1110 一次 401 APIG.0301 直接 Disable → 账号永久禁用，watchdog 跳过，
+//     凭据不再刷新，直到手工改 state.json 才恢复
+//
+// 所以这里把分类显式化，并规定每类错误对账号状态的影响。判据用「完整错误码」
+// 匹配（带前后边界），不匹配裸子串：第三方项目有 `"1005" in text` 把
+// InferHub.001001005（参数非法）误判成权益耗尽的真实事故。
+
+type upstreamErrorKind int
+
+const (
+	errKindUnknown upstreamErrorKind = iota
+	// errKindModelUnavailable 该账号不能用这个模型（未注册/未开通/福利过期/路由未发布）。
+	// 换账号可能有用，但不处罚账号，只记录「账号×模型」不可用。
+	errKindModelUnavailable
+	// errKindAuth 凭据/签名问题：401、APIG.0301、APIG.0602。可刷新一次后重试。
+	errKindAuth
+	// errKindAuthExpired refresh_token 终态失效（STS5.1806）：只能重新登录。
+	errKindAuthExpired
+	// errKindParamInvalid 请求形状或模型能力不匹配（001001005 参数非法、
+	// 001001020 多模态不匹配）。换账号结果相同，不轮换、不冷却。
+	errKindParamInvalid
+	// errKindContentModeration 本次内容被上游内容审查拒绝。换账号/换措辞都可能
+	// 过不了，但不是账号故障。
+	errKindContentModeration
+	// errKindConcurrentLimit 并发会话/排队（TM.00001041、TPM 排队）。瞬时。
+	errKindConcurrentLimit
+	// errKindRateLimit 429 / 模型级限流。
+	errKindRateLimit
+	// errKindServer 真正的上游 5xx。
+	errKindServer
+)
+
+func (k upstreamErrorKind) String() string {
+	switch k {
+	case errKindModelUnavailable:
+		return "model_unavailable"
+	case errKindAuth:
+		return "auth"
+	case errKindAuthExpired:
+		return "auth_expired"
+	case errKindParamInvalid:
+		return "param_invalid"
+	case errKindContentModeration:
+		return "content_moderation"
+	case errKindConcurrentLimit:
+		return "concurrent_limit"
+	case errKindRateLimit:
+		return "rate_limit"
+	case errKindServer:
+		return "server"
+	}
+	return "unknown"
+}
+
+func isAlnumByte(b byte) bool {
+	return b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+}
+
+// containsCode 按「完整错误码」匹配：前后必须是边界，避免 001001005 里的
+// 1005 被当成独立码。msg 必须已转小写。
+func containsCode(low, code string) bool {
+	if code == "" {
+		return false
+	}
+	for i := 0; ; {
+		idx := strings.Index(low[i:], code)
+		if idx < 0 {
+			return false
+		}
+		idx += i
+		beforeOK := idx == 0 || !isAlnumByte(low[idx-1])
+		end := idx + len(code)
+		afterOK := end >= len(low) || !isAlnumByte(low[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		i = idx + 1
+	}
+}
+
+// upstreamErrorText 提取上游错误的可判定文本（码 + 说明），兼容两类错误类型。
+func upstreamErrorText(err error) string {
 	if err == nil {
 		return ""
 	}
-	msg := strings.ToLower(err.Error())
-	switch {
-	case strings.Contains(msg, "002002009") || strings.Contains(msg, "not registered"):
-		return "模型未在当前账号注册"
-	case strings.Contains(msg, "4004.200") || strings.Contains(msg, "benefit not found"):
-		return "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
-	case strings.Contains(msg, "000010051") || strings.Contains(msg, "无权调用该模型"):
-		// TM.000010051 是模型级错误（企业侧未开通该模型），换账号结果相同；
-		// 绝不能落到 5xx 分支把健康账号冷却 10 分钟（1107 实测单账号池整瘫）。
-		return "账号无权调用该模型（企业侧未开通）"
-	case strings.Contains(msg, "apig.0101") || strings.Contains(msg, "api does not exist or has not been published"):
-		// APIG.0101.404 出现在这里有两个来源：该模型没在本账号环境发布、或上游
-		// 网关把「模型路由不存在」包装成 502。两种都是模型级结论，换账号不会变；
-		// 1109 实测：调 glm-5.3-flash 拿到它 → 被当 5xx → 单账号池整瘫 10 分钟。
-		return "模型在上游网关上不可用（未发布或路由不存在）"
+	var ue *upstream.UpstreamError
+	if errors.As(err, &ue) {
+		return ue.Code + " " + ue.Msg
 	}
-	return ""
+	var ae *upstream.ApiError
+	if errors.As(err, &ae) {
+		return ae.Message
+	}
+	return err.Error()
+}
+
+// classifyUpstreamError 把错误分类成 (类别, 人类可读原因)。
+func classifyUpstreamError(err error) (upstreamErrorKind, string) {
+	return classifyUpstreamMessage(upstreamErrorText(err))
+}
+
+// classifyUpstreamMessage 对一段上游错误文本分类。判据顺序即优先级：
+// 越「具体、越不该罚账号」的类别越靠前。
+func classifyUpstreamMessage(msg string) (upstreamErrorKind, string) {
+	low := strings.ToLower(msg)
+	switch {
+	// --- 终态凭据失效：必须重新登录 ---
+	case containsCode(low, "sts5.1806") || strings.Contains(low, "invalid refresh token") ||
+		strings.Contains(low, "refresh token has been used") || strings.Contains(low, "invalid client id"):
+		return errKindAuthExpired, "refresh_token 已失效，需要重新登录（/admin/api/oauth/start 或 codearts2api login）"
+
+	// --- 内容审查：本次内容被拒 ---
+	case strings.Contains(low, "modelarts.81011") || strings.Contains(low, "抱歉，我无法提供关于您提问内容的建议"):
+		return errKindContentModeration, "上游内容审查拒绝了本次请求"
+
+	// --- 请求形状 / 模型能力不匹配：换账号无用 ---
+	case containsCode(low, "001001005") || strings.Contains(low, "request param is invalid"):
+		return errKindParamInvalid, "上游判定请求参数非法（InferHub.001001005）"
+	case containsCode(low, "001001020") || strings.Contains(low, "multimodal"):
+		return errKindParamInvalid, "该模型不支持本次消息形态（多模态不匹配，InferHub.001001020）"
+
+	// --- 模型级不可用：不罚账号，记「账号×模型」 ---
+	case containsCode(low, "002002009") || strings.Contains(low, "not registered"):
+		return errKindModelUnavailable, "模型未在当前账号注册"
+	case containsCode(low, "4004.200") || strings.Contains(low, "benefit not found"):
+		return errKindModelUnavailable, "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
+	case containsCode(low, "000010051") || strings.Contains(low, "无权调用该模型"):
+		return errKindModelUnavailable, "账号无权调用该模型（企业侧未开通）"
+	case containsCode(low, "apig.0101") || strings.Contains(low, "api does not exist or has not been published"):
+		return errKindModelUnavailable, "模型在上游网关上不可用（未发布或路由不存在）"
+
+	// --- 并发/排队：瞬时 ---
+	case containsCode(low, "00001041") || strings.Contains(low, "并发会话"):
+		return errKindConcurrentLimit, "上游并发会话已达上限（瞬时，可重试）"
+
+	// --- 限流 ---
+	case strings.Contains(low, "modelarts.81111.429") || strings.Contains(low, "tpm limit") ||
+		strings.Contains(low, "rate limit"):
+		return errKindRateLimit, "上游限流（429/TPM）"
+
+	// --- 凭据/签名：可刷新一次 ---
+	case containsCode(low, "apig.0301") || strings.Contains(low, "decrypt token fail") ||
+		containsCode(low, "apig.0602") || strings.Contains(low, "verify ak sk signature fail") ||
+		strings.Contains(low, "token expired"):
+		return errKindAuth, "上游拒绝凭据或签名（APIG.0301/0602）"
+	}
+	return errKindUnknown, ""
+}
+
+// upstreamUnavailableReason 把上游错误归类为「该模型对这个账号不可用」，否则返回空串。
+func upstreamUnavailableReason(err error) string {
+	kind, reason := classifyUpstreamError(err)
+	if kind != errKindModelUnavailable {
+		return ""
+	}
+	return reason
 }
 
 // probeModel 用一条最小请求真实试一次该模型，并记录结果。
@@ -250,18 +392,11 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 
 // upstreamUnavailableReasonText 同 upstreamUnavailableReason，作用于响应正文。
 func upstreamUnavailableReasonText(s string) string {
-	low := strings.ToLower(s)
-	switch {
-	case strings.Contains(low, "002002009") || strings.Contains(low, "not registered"):
-		return "模型未在当前账号注册"
-	case strings.Contains(low, "4004.200") || strings.Contains(low, "benefit not found"):
-		return "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
-	case strings.Contains(low, "000010051") || strings.Contains(low, "无权调用该模型"):
-		return "账号无权调用该模型（企业侧未开通）"
-	case strings.Contains(low, "apig.0101") || strings.Contains(low, "api does not exist or has not been published"):
-		return "模型在上游网关上不可用（未发布或路由不存在）"
+	kind, reason := classifyUpstreamMessage(s)
+	if kind != errKindModelUnavailable {
+		return ""
 	}
-	return ""
+	return reason
 }
 
 // StartAvailabilityProber 供 main 启动后台探测器。

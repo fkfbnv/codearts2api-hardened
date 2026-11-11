@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +48,13 @@ type Config struct {
 	QueueRetrySeconds int `json:"queue_retry_seconds"`
 	// QueueMaxAttempts 排队重试次数上限（默认 30，约 5 分钟）。
 	QueueMaxAttempts int `json:"queue_max_attempts"`
+
+	// MaxBodyMB 单个 chat 请求体上限（MB，默认 32）。1107 实测 8MB 会在长会话 +
+	// 图片 base64 时 413；前置 nginx/网关承受力不同，故可配。
+	MaxBodyMB int `json:"max_body_mb"`
+	// CatalogCacheFile 模型目录缓存文件（默认与 state_file 同目录 models-cache.json）。
+	// 落盘后重启可先读缓存，不必冷启动就打上游三路发现。
+	CatalogCacheFile string `json:"catalog_cache_file"`
 
 	// BenefitAutoClaim 模型发现时自动领取限时福利（默认 true）。
 	// 领取是幂等操作（官方客户端打开模型菜单即调用），不领取时福利模型一律
@@ -230,6 +238,14 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("CA2A_CREDITS_AUTO_CLAIM"); v != "" {
 		c.CreditsAutoClaim = v == "1" || strings.EqualFold(v, "true")
 	}
+	if v := os.Getenv("CA2A_MAX_BODY_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.MaxBodyMB = n
+		}
+	}
+	if v := os.Getenv("CA2A_CATALOG_CACHE_FILE"); v != "" {
+		c.CatalogCacheFile = v
+	}
 }
 
 func (c *Config) normalize() error {
@@ -266,6 +282,16 @@ func (c *Config) normalize() error {
 	}
 	if c.MaxConcurrent <= 0 {
 		c.MaxConcurrent = 1 // 上游并发会话释放慢，单账号串行最稳
+	}
+	if c.MaxBodyMB <= 0 {
+		c.MaxBodyMB = 32
+	}
+	if c.CatalogCacheFile == "" {
+		dir := filepath.Dir(c.StateFile)
+		if dir == "" || dir == "." {
+			dir = "."
+		}
+		c.CatalogCacheFile = filepath.Join(dir, "models-cache.json")
 	}
 	return nil
 }

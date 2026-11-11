@@ -20,6 +20,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -96,6 +98,21 @@ func init() {
 	}
 }
 
+// anonCatalogID 空 user_id 账号的目录键。
+//
+// 本机 auths 文件里 user_id 常为空串（账号本身完全可用），而 setAccountModels
+// 原本遇到空 ID 直接 return → 目录不进缓存、福利标记失效、落盘永远空表。
+// 与 server/availability.go 的 anonAccountID 同一个哨兵思路。
+const anonCatalogID = "\x00anon"
+
+// catalogAccountID 把空账号 ID 归一成哨兵值。
+func catalogAccountID(accountID string) string {
+	if accountID == "" {
+		return anonCatalogID
+	}
+	return accountID
+}
+
 // SetAccountModels 整体替换某账号的模型目录（不是增补：套餐轮换后旧模型不得残留）。
 // 等价于「本轮福利来源也成功」，因此不保留上一轮福利记忆。
 func SetAccountModels(accountID string, infos []ModelInfo) {
@@ -108,7 +125,8 @@ func SetAccountModels(accountID string, infos []ModelInfo) {
 // 福利条目，否则非种子的福利模型会瞬间丢掉 maas_type: benefit 标记，直到下一次
 // 刷新成功为止——这期间它们在上游按未注册模型 404。
 func setAccountModels(accountID string, infos []ModelInfo, keepBenefit bool) {
-	if accountID == "" {
+	accountID = catalogAccountID(accountID)
+	if len(infos) == 0 {
 		return
 	}
 	ac := &accountCatalog{
@@ -168,6 +186,7 @@ func setAccountModels(accountID string, infos []ModelInfo, keepBenefit bool) {
 
 // AccountModels 返回某账号的模型目录快照（未发现时 ok=false）。
 func AccountModels(accountID string) ([]ModelInfo, bool) {
+	accountID = catalogAccountID(accountID)
 	catalog.RLock()
 	defer catalog.RUnlock()
 	ac, ok := catalog.accounts[accountID]
@@ -177,8 +196,138 @@ func AccountModels(accountID string) ([]ModelInfo, bool) {
 	return append([]ModelInfo(nil), ac.infos...), true
 }
 
+// ---------------------------------------------------------------------------
+// 模型目录落盘缓存
+// ---------------------------------------------------------------------------
+//
+// 三路发现要打 4-5 个上游接口（agent-center 列表 + detail + builtin + benefit）。
+// 进程重启后如果只靠内存，冷启动的第一个 /v1/models 要整轮串行等完，期间客户端
+// 看不到模型；容器/网关重启频繁时更明显。所以把目录落盘，启动时先恢复，
+// 过期后由后台单飞刷新（见 server.fetchDynamicModels）。
+
+var catalogCachePath string
+
+// SetCatalogCacheFile 指定目录缓存路径（空 = 不落盘）。
+func SetCatalogCacheFile(path string) { catalogCachePath = path }
+
+type catalogCacheEntry struct {
+	Infos   []ModelInfo `json:"infos"`
+	Benefit []string    `json:"benefit,omitempty"`
+	Fetched time.Time   `json:"fetched"`
+}
+
+// LoadCatalogCache 从磁盘恢复目录缓存（启动时调用；失败只返回错误，不影响服务）。
+// 恢复的 fetched 时间原样保留，这样过期判断仍然有效，不会把旧目录当成新发现。
+func LoadCatalogCache(path string) error {
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var data struct {
+		Accounts map[string]catalogCacheEntry `json:"accounts"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return fmt.Errorf("parse catalog cache: %w", err)
+	}
+	catalog.Lock()
+	defer catalog.Unlock()
+	for accountID, e := range data.Accounts {
+		if accountID == "" || len(e.Infos) == 0 {
+			continue
+		}
+		ac := &accountCatalog{
+			infos:       append([]ModelInfo(nil), e.Infos...),
+			benefit:     make(map[string]bool, len(e.Benefit)),
+			knows:       make(map[string]bool, len(e.Infos)),
+			lastBenefit: map[string]ModelInfo{},
+			fetched:     e.Fetched,
+		}
+		for _, id := range e.Benefit {
+			ac.benefit[strings.ToLower(id)] = true
+		}
+		for _, mi := range ac.infos {
+			if mi.ID == "" {
+				continue
+			}
+			key := strings.ToLower(mi.ID)
+			ac.knows[key] = true
+			if mi.Benefit {
+				ac.lastBenefit[key] = mi
+			}
+			if _, ok := catalog.known[key]; !ok || mi.ID != key {
+				catalog.known[key] = mi.ID
+			}
+		}
+		catalog.accounts[accountID] = ac
+	}
+	return nil
+}
+
+// saveCatalogCacheSnapshot 把当前目录写到磁盘（先复制快照再写，避免长时间持锁）。
+func saveCatalogCacheSnapshot() error {
+	path := catalogCachePath
+	if path == "" {
+		return nil
+	}
+	catalog.RLock()
+	data := struct {
+		Accounts map[string]catalogCacheEntry `json:"accounts"`
+	}{Accounts: make(map[string]catalogCacheEntry, len(catalog.accounts))}
+	for id, ac := range catalog.accounts {
+		benefit := make([]string, 0, len(ac.benefit))
+		for k := range ac.benefit {
+			benefit = append(benefit, k)
+		}
+		sort.Strings(benefit)
+		data.Accounts[id] = catalogCacheEntry{
+			Infos:   append([]ModelInfo(nil), ac.infos...),
+			Benefit: benefit,
+			Fetched: ac.fetched,
+		}
+	}
+	catalog.RUnlock()
+
+	raw, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return err
+	}
+	if dir := filepath.Dir(path); dir != "" {
+		_ = os.MkdirAll(dir, 0o700)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// persistCatalog 异步落盘，避免把磁盘 IO 放进请求路径；连续刷新时合并且不排队。
+var persistCatalog = func() func() {
+	var mu sync.Mutex
+	pending := false
+	return func() {
+		mu.Lock()
+		if pending {
+			mu.Unlock()
+			return
+		}
+		pending = true
+		mu.Unlock()
+		go func() {
+			_ = saveCatalogCacheSnapshot()
+			mu.Lock()
+			pending = false
+			mu.Unlock()
+		}()
+	}
+}()
+
 // AccountCatalogStale 报告某账号目录是否需重新发现（未发现或超过 CatalogTTL）。
 func AccountCatalogStale(accountID string) bool {
+	accountID = catalogAccountID(accountID)
 	catalog.RLock()
 	defer catalog.RUnlock()
 	ac, ok := catalog.accounts[accountID]
@@ -200,7 +349,7 @@ func IsBenefitModel(accountID, model string) bool {
 	}
 	catalog.RLock()
 	defer catalog.RUnlock()
-	if ac, ok := catalog.accounts[accountID]; ok {
+	if ac, ok := catalog.accounts[catalogAccountID(accountID)]; ok {
 		if ac.benefit[key] {
 			return true
 		}
@@ -325,6 +474,7 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 	}
 	// 福利来源失败但内置来源成功：保留上一轮已确认的福利条目，别把标记弄丢。
 	setAccountModels(accountID, out, builtinOK && !benefitOK)
+	persistCatalog()
 	return out, nil
 }
 

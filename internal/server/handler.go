@@ -36,11 +36,16 @@ type Config struct {
 	// 也可能嵌在 HTTP 200 SSE 内。默认每 10s 重试一次、最多 30 次（约 5 分钟）。
 	QueueRetryDelay  time.Duration
 	QueueMaxAttempts int
-	DefaultModel     string
-	ConvStateFile    string
-	WatchInfo        map[string]any
-	AuthDir          string
-	Listen           string
+	// MaxBodyBytes 单个 chat 请求体上限。0 表示用 DefaultMaxBodyBytes。
+	// 上游长会话 + 图片 base64 很容易顶破 8MB（1107 事故），32MB 是实测可用值；
+	// 但不同部署环境（前置 nginx / 网关）承受力不同，所以做成配置。
+	MaxBodyBytes int64
+	// DefaultModel 未指定模型时的默认值。
+	DefaultModel  string
+	ConvStateFile string
+	WatchInfo     map[string]any
+	AuthDir       string
+	Listen        string
 	// OAuthClient 短超时客户端，用于 WebUI 登录换取 token（可注入测试端点）。
 	OAuthClient *upstream.Client
 	// LoginConfig WebUI 登录配置（client_id 以官方客户端为准）。
@@ -51,9 +56,10 @@ type Config struct {
 
 var dynamicModelsCache struct {
 	sync.RWMutex
-	ids      []upstream.ModelInfo
-	fetched  time.Time
-	lastFail time.Time
+	ids        []upstream.ModelInfo
+	fetched    time.Time
+	lastFail   time.Time
+	refreshing bool
 }
 
 // staticModel 静态兜底模型：动态发现失败时 /v1/models 仍能列出实测可用模型。
@@ -86,7 +92,8 @@ const (
 	modelsFetchFailCooldown = 5 * time.Minute
 )
 
-const maxBodyBytes = 32 << 20
+// DefaultMaxBodyBytes 请求体默认上限（1107 实测 8MB 会 413，32MB 够长会话+图）。
+const DefaultMaxBodyBytes int64 = 32 << 20
 
 // Handler 主路由。
 type Handler struct {
@@ -137,6 +144,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.DefaultModel == "" {
 		cfg.DefaultModel = "glm-5.2"
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = DefaultMaxBodyBytes
 	}
 	if cfg.Upstream == nil {
 		cfg.Upstream = upstream.New(120 * time.Second)
@@ -532,24 +542,67 @@ func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 	return out
 }
 
-// fetchDynamicModels 刷新各账号模型目录并返回合并后的展示列表，缓存 1h。
+// fetchDynamicModels 返回模型展示列表，缓存 1h。
 //
-// 目录按账号存放（限时福利按账号授予，账号之间不能互相污染），因此这里逐个健康
-// 账号发现并写入其目录；发现失败的账号沿用旧目录或冷启动种子。
+// 策略（2026-11-11）：有缓存就立即返回，过期后由**后台单飞**刷新，不阻塞调用方。
+// 三路发现要串行打 4-5 个上游接口，同步等完会让 /v1/models 和首个聊天请求一起
+// 卡住（第三方实现同样结论：模型目录刷新不能阻塞聊天首字）。冷启动没有内存缓存，
+// 但 main 会先从 models-cache.json 恢复目录，所以正常情况不会走到同步发现。
+//
+// 目录按账号存放（限时福利按账号授予，账号之间不能互相污染）。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.RLock()
-	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
-		out := dynamicModelsCache.ids
-		dynamicModelsCache.RUnlock()
-		return out
-	}
-	// 失败负缓存：冷却期内不再请求上游。
-	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
-		dynamicModelsCache.RUnlock()
-		return nil
-	}
+	ids := dynamicModelsCache.ids
+	fetched := dynamicModelsCache.fetched
+	lastFail := dynamicModelsCache.lastFail
+	refreshing := dynamicModelsCache.refreshing
 	dynamicModelsCache.RUnlock()
 
+	if len(ids) > 0 && time.Since(fetched) < dynamicModelsTTL {
+		return ids
+	}
+	// 失败负缓存：冷却期内不再请求上游。
+	if !lastFail.IsZero() && time.Since(lastFail) < modelsFetchFailCooldown {
+		return ids
+	}
+	// 已有刷新在跑：先返回旧目录，等它写完。
+	if refreshing {
+		return ids
+	}
+
+	dynamicModelsCache.Lock()
+	if dynamicModelsCache.refreshing {
+		dynamicModelsCache.Unlock()
+		return ids
+	}
+	dynamicModelsCache.refreshing = true
+	dynamicModelsCache.Unlock()
+
+	if len(ids) > 0 {
+		// 有旧目录可展示：后台刷新，调用方立即拿到旧值。
+		go func() {
+			defer h.finishModelRefresh()
+			h.refreshDynamicModels()
+		}()
+		return ids
+	}
+	// 冷启动且无缓存：同步拉一次（否则客户端看不到任何模型）。
+	h.refreshDynamicModels()
+	h.finishModelRefresh()
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	return dynamicModelsCache.ids
+}
+
+// finishModelRefresh 清掉「正在刷新」标记。
+func (h *Handler) finishModelRefresh() {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.refreshing = false
+	dynamicModelsCache.Unlock()
+}
+
+// refreshDynamicModels 真正执行发现并更新缓存（调用方负责 refreshing 标记）。
+func (h *Handler) refreshDynamicModels() []upstream.ModelInfo {
 	var sets [][]upstream.ModelInfo
 	for _, acct := range h.cfg.Pool.Accounts() {
 		if acct.Auth == nil || !h.cfg.Pool.Healthy(acct.Name) {
@@ -672,13 +725,14 @@ func catalogHas(models []upstream.ModelInfo, wantLower string) bool {
 // ---------------------------------------------------------------------------
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, h.cfg.MaxBodyBytes+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
-	if len(body) > maxBodyBytes {
-		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 32MB limit")
+	if int64(len(body)) > h.cfg.MaxBodyBytes {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+			fmt.Sprintf("request body exceeds %dMB limit", h.cfg.MaxBodyBytes>>20))
 		return
 	}
 	req, err := parseChatRequest(body)
@@ -898,13 +952,45 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 			if werr != nil {
 				log.Printf("chat stream account=%s error: %v", acct.Name, werr)
-				// 流式响应头已经发出去了，没法再回 404；但必须把「这个模型对这个
+				// 首帧就是错误：HTTP 头尚未写出，可以回真正的状态码 + JSON。
+				// 这条路径覆盖「上游 200 但正文第一帧就带 error_code」——以前只能
+				// 发 200 + SSE error 事件，客户端把模型不存在/参数非法当成流中断。
+				var pre *upstream.PreStreamError
+				if errors.As(werr, &pre) {
+					kind, reason := classifyUpstreamError(pre.Err)
+					h.handleUpstreamError(acct, model, pre.Err)
+					switch kind {
+					case errKindModelUnavailable:
+						writeOpenAIError(w, http.StatusNotFound, "model_not_available",
+							"model "+model+" is not available: "+truncateMsg(pre.Err.Error(), 200))
+					case errKindParamInvalid:
+						writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+							"upstream rejected request params: "+truncateMsg(pre.Err.Error(), 200))
+					case errKindContentModeration:
+						writeOpenAIError(w, http.StatusBadRequest, "content_filter",
+							"upstream content moderation rejected this request: "+truncateMsg(pre.Err.Error(), 200))
+					case errKindAuthExpired:
+						writeOpenAIError(w, http.StatusUnauthorized, "relogin_required", reason)
+					case errKindAuth:
+						writeOpenAIError(w, http.StatusBadGateway, "upstream_auth_error",
+							"upstream rejected credentials: "+truncateMsg(pre.Err.Error(), 200))
+					case errKindRateLimit, errKindConcurrentLimit:
+						writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit",
+							"upstream busy: "+truncateMsg(pre.Err.Error(), 200))
+					default:
+						writeOpenAIError(w, http.StatusBadGateway, "upstream_error",
+							truncateMsg(pre.Err.Error(), 300))
+					}
+					return
+				}
+				// 流式响应头已经发出去了，没法再改状态码；但必须把「这个模型对这个
 				// 账号不可用」记进可用性缓存，否则错误会累计到阈值把账号冷却——
 				// 上游把模型级错误塞进 200 的 SSE 正文（如 APIG.0101）时正是这条路。
 				if reason := upstreamUnavailableReason(werr); reason != "" {
 					markUnusable(acct.UID, model, reason)
 					log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
-				} else if !isParamInvalidError(werr) {
+				} else if kind, _ := classifyUpstreamError(werr); kind != errKindParamInvalid &&
+					kind != errKindContentModeration && kind != errKindConcurrentLimit {
 					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 				}
 			} else {
@@ -1147,44 +1233,63 @@ func buildCompletion(model, reasoning, content string, calls []openAIToolCall, f
 // handleUpstreamError 记录错误并决定是否处罚账号。
 // 返回 true 表示这是「模型对这个账号不可用」的模型级错误：调用方应立即结束
 // 轮转并向客户端返回明确错误（换账号也是同样的结果）。
+//
+// 分类见 availability.go 的 classifyUpstreamError；每个类别对账号状态的影响
+// 都在下面的 switch 里显式写明，不再靠猜 HTTP 状态码。
 func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err error) bool {
-	if isParamInvalidError(err) {
-		return false
-	}
-	// 「模型对这个账号不可用」是账号能力问题，不是账号故障，必须在状态码分支
-	// **之前**判断：这类错误会被上游包装成 5xx / 塞进 200 的 SSE 正文，落到
-	// 下面的 `ae.Status >= 500` 或 NoteError 阈值就把健康账号冷却 10 分钟——
-	// 实测调用一个未注册模型，整个账号被冷却，后续正常请求全部失败。
-	// 判据放在 ApiError 分支之外：SSE 正文里的错误是 *upstream.UpstreamError，
-	// 以前完全绕过这里，只能靠 NoteError 累计到阈值才炸（1109 实测）。
-	if reason := upstreamUnavailableReason(err); reason != "" {
+	kind, reason := classifyUpstreamError(err)
+	switch kind {
+	case errKindModelUnavailable:
 		markUnusable(acct.UID, model, reason)
 		log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
 		return true
-	}
-	// 内容审查拒绝同样不是账号故障，但它也不是「模型不可用」——换个话题请求就能
-	// 成功，所以只告诉客户端被拒，不动账号状态。
-	if isContentModerationError(err) {
+
+	case errKindParamInvalid:
+		// 请求形状/模型能力问题：换账号结果相同，不轮转、不冷却、不记错误。
+		log.Printf("upstream param invalid (no penalty) account=%s model=%s msg=%s",
+			acct.Name, model, truncateMsg(upstreamErrorText(err), 160))
+		return false
+
+	case errKindContentModeration:
 		log.Printf("upstream content moderation reject account=%s model=%s msg=%s",
 			acct.Name, model, truncateMsg(err.Error(), 120))
 		return false
+
+	case errKindAuthExpired:
+		// refresh_token 终态失效：只能重新登录，禁用是正确动作（不会自愈）。
+		h.cfg.Pool.Disable(acct.Name, reason)
+		log.Printf("account disabled (re-login required) account=%s: %s", acct.Name, reason)
+		return false
+
+	case errKindAuth:
+		// 1110 事故：这里以前是 Disable，一次 401 就把账号永久禁用，watchdog
+		// 跳过 disabled 账号 → 凭据不再刷新 → 整池 503 直到手工改 state.json。
+		// 改为软冷却 + 记录：请求路径已先尝试刷新 token（handler 主循环），
+		// 走到这里说明刷新失败或是瞬时签名问题，短冷却足以自愈。
+		h.cfg.Pool.Cooldown(acct.Name, pool.CoolSoft, h.cfg.SoftCooldown, reason)
+		log.Printf("upstream auth error (soft cooldown, not disabled) account=%s: %s msg=%s",
+			acct.Name, reason, truncateMsg(upstreamErrorText(err), 160))
+		return false
+
+	case errKindConcurrentLimit:
+		// 并发会话上限是瞬时错误：上游槽位释放慢，冷却反而误伤后续请求。
+		log.Printf("upstream concurrent limit (transient) account=%s msg=%s",
+			acct.Name, truncateMsg(upstreamErrorText(err), 80))
+		return false
+
+	case errKindRateLimit:
+		h.cfg.Pool.Cooldown(acct.Name, pool.CoolSoft, h.cfg.SoftCooldown, reason)
+		return false
+
+	case errKindServer:
+		h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, upstreamErrorText(err))
+		return false
 	}
+
+	// 未识别：仍按状态码兜底（5xx/429 走冷却，其余累计错误）。
 	var ae *upstream.ApiError
-	if errors.As(err, &ae) {
-		switch {
-		case ae.Status == 401 || ae.Code == 401:
-			h.cfg.Pool.Disable(acct.Name, "401 "+ae.Message)
-		case ae.Status == 429:
-			h.cfg.Pool.Cooldown(acct.Name, pool.CoolSoft, h.cfg.SoftCooldown, ae.Error())
-		case ae.Status == 400 && isConcurrentLimitError(ae.Message):
-			// 并发会话上限（TM.00001041）是瞬时错误：上游会话槽位会被其他请求释放，
-			// 不冷却账号——池的并发锁已防止过载，冷却反而误伤后续请求。
-			log.Printf("upstream concurrent limit (transient) account=%s msg=%s", acct.Name, truncateMsg(ae.Message, 80))
-		case ae.Status >= 500:
-			h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, ae.Error())
-		default:
-			h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-		}
+	if errors.As(err, &ae) && ae.Status >= 500 {
+		h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, ae.Error())
 		return false
 	}
 	h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
@@ -1196,36 +1301,18 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 // 这类响应是「这次请求的内容我不答」，跟账号健康、跟模型能力都无关：换账号逐字
 // 重放同一段内容，上游还是拒。上游把它包成 502，于是落到 `ae.Status >= 500`
 // 分支把单账号池冷 10 分钟——1109 实测长中文/敏感话题一句话就能打掉整池。
-// 正确处理是直接把拒绝原因回给客户端，不罚账号、不记模型不可用。
 func isContentModerationError(err error) bool {
-	if err == nil {
-		return false
-	}
-	low := strings.ToLower(err.Error())
-	return strings.Contains(low, "modelarts.81011") ||
-		strings.Contains(low, "inferhub.modelarts.81011") ||
-		strings.Contains(low, "抱歉，我无法提供关于您提问内容的建议")
+	kind, _ := classifyUpstreamError(err)
+	return kind == errKindContentModeration
 }
 
-// isParamInvalidError 判断是否为上游「请求参数无效」类错误（InferHub.001001005）。
+// isParamInvalidError 判断是否为上游「请求参数/能力不匹配」类错误
+// （InferHub.001001005 参数非法、001001020 多模态不匹配）。
 // 这类错误是客户端请求形状问题：换账号结果相同，绝不能冷却账号（曾因此打停整池）。
+// 判据集中在 availability.go 的 classifyUpstreamMessage，避免多份字符串表漂移。
 func isParamInvalidError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var apiErr *upstream.ApiError
-	var streamErr *upstream.UpstreamError
-	var message string
-	switch {
-	case errors.As(err, &apiErr):
-		message = apiErr.Message
-	case errors.As(err, &streamErr):
-		message = streamErr.Code + " " + streamErr.Msg
-	default:
-		return false
-	}
-	low := strings.ToLower(message)
-	return strings.Contains(low, "inferhub.001001005") || strings.Contains(low, "request param is invalid")
+	kind, _ := classifyUpstreamError(err)
+	return kind == errKindParamInvalid
 }
 
 // isConcurrentLimitError 判断是否为上游并发会话上限错误（瞬时、可重试）。

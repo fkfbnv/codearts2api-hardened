@@ -47,6 +47,18 @@ func main() {
 	c := upstream.New(120 * time.Second)
 	c.SetBenefitAutoClaim(cfg.BenefitAutoClaim)
 
+	// 模型目录落盘缓存：重启后先用磁盘里的目录，过期由后台单飞刷新。
+	upstream.SetCatalogCacheFile(cfg.CatalogCacheFile)
+	if err := upstream.LoadCatalogCache(cfg.CatalogCacheFile); err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("catalog cache: none yet (%s)", cfg.CatalogCacheFile)
+		} else {
+			log.Printf("catalog cache: load failed: %v", err)
+		}
+	} else {
+		log.Printf("catalog cache loaded from %s", cfg.CatalogCacheFile)
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:              p,
 		Enabled:           cfg.Watch.Enabled,
@@ -72,6 +84,7 @@ func main() {
 			return 10 * time.Second
 		}(),
 		QueueMaxAttempts: cfg.QueueMaxAttempts,
+		MaxBodyBytes:     int64(cfg.MaxBodyMB) << 20,
 		ConvStateFile:    cfg.StateFile + ".chats.json",
 		WatchInfo: map[string]any{
 			"enabled":              cfg.Watch.Enabled,
