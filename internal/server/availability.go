@@ -27,6 +27,8 @@ import (
 //   - 上游报 not registered / benefit not found 时立即记为不可用（从真实流量学习）
 
 const (
+	modelAccessDeniedReason = "当前账号无权调用该模型"
+
 	// availabilityTTL 探测结果有效期。套餐/福利变化后最多滞后这么久。
 	availabilityTTL = 30 * time.Minute
 	// probeTimeout 单次探测超时。
@@ -274,10 +276,14 @@ func classifyUpstreamMessage(msg string) (upstreamErrorKind, string) {
 		return errKindParamInvalid, "该模型不支持本次消息形态（多模态不匹配，InferHub.001001020）"
 
 	// --- 模型级不可用：不罚账号，记「账号×模型」 ---
+	// 上游 #11：无权类错误集合比逐个错误码更全（含大小写变体），放最前；
+	// 命中后用 modelAccessDeniedReason 哨兵，handler 据此换号而不是 404。
+	case upstream.IsModelAccessErrorMessage(msg):
+		return errKindModelUnavailable, modelAccessDeniedReason
 	case containsCode(low, "002002009") || strings.Contains(low, "not registered"):
 		return errKindModelUnavailable, "模型未在当前账号注册"
 	case containsCode(low, "4004.200") || strings.Contains(low, "benefit not found"):
-		return errKindModelUnavailable, "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
+		return errKindModelUnavailable, "限时福利未领取或已过期"
 	case containsCode(low, "000010051") || strings.Contains(low, "无权调用该模型"):
 		return errKindModelUnavailable, "账号无权调用该模型（企业侧未开通）"
 	case containsCode(low, "apig.0101") || strings.Contains(low, "api does not exist or has not been published"):
@@ -346,13 +352,7 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 	cred := upstream.SignCredential{AccessKeyID: ak, SecretAccessKey: sk, SecurityToken: token}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	body := map[string]any{
-		"model":    upstream.CanonicalModel(model),
-		"stream":   true,
-		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
-	}
-	rc, err := acct.Client.SendChatV2(ctx, body, "", cred, cred.SecurityToken,
-		upstream.IsBenefitModel(acct.UID, model))
+	rc, err := acct.Client.ProbeModel(ctx, model, cred, upstream.IsBenefitModel(acct.UID, model))
 	if err != nil {
 		// 并发上限是暂时的，不代表模型不可用。
 		if strings.Contains(err.Error(), "TM.00001041") {

@@ -494,6 +494,21 @@ func (h *Handler) probeUnknownAsync() {
 	}()
 }
 
+// hasFreshCandidate 报告是否还有没试过、健康、且未被判定「该模型不可用」的
+// 账号（上游 #11：模型级错误先换号，全部候选判死才 404）。
+func (h *Handler) hasFreshCandidate(model string, tried map[string]bool) bool {
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
+			continue
+		}
+		if st, _ := modelAvailability(acct.UID, model); st == availUnusable {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 // modelKnownUnusable 报告该模型是否在**所有**健康账号上都被判定为不可用。
 // 只要有一个账号没结论或可用，就返回 false（列表保留该模型）。
 func (h *Handler) modelKnownUnusable(model string) bool {
@@ -821,6 +836,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tried := map[string]bool{}
+	// 上游 #11：已判定「该账号无权调用该模型」的账号直接跳过，不浪费一次
+	// 上游往返去复现同样错误。
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if st, reason := modelAvailability(acct.UID, model); st == availUnusable && reason == modelAccessDeniedReason {
+			tried[acct.Name] = true
+		}
+	}
+	if tried[stickyAcct] {
+		stickyAcct = ""
+	}
 	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		var acct *pool.Account
@@ -954,10 +979,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			lastErr = serr
 			if h.handleUpstreamError(acct, model, serr) {
-				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
-				writeOpenAIError(w, http.StatusNotFound, "model_not_available",
-					"model "+model+" is not available: "+truncateMsg(serr.Error(), 200))
-				return
+				// 模型级错误：还有没试过的健康账号就先换号（多账号时 B 可能
+				// 有权限），全判死才给客户端明确答复。
+				if !h.hasFreshCandidate(model, tried) {
+					writeOpenAIError(w, http.StatusNotFound, "model_not_available",
+						"model "+model+" is not available: "+truncateMsg(serr.Error(), 200))
+					return
+				}
 			}
 			continue
 		}
@@ -999,6 +1027,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if errors.As(werr, &pre) {
 					kind, reason := classifyUpstreamError(pre.Err)
 					h.handleUpstreamError(acct, model, pre.Err)
+					if kind == errKindModelUnavailable && h.hasFreshCandidate(model, tried) {
+						// 响应头尚未写出，还有没试过的健康账号就直接换号重试
+						//（多账号时 B 可能有权限）。
+						continue
+					}
 					switch kind {
 					case errKindModelUnavailable:
 						writeOpenAIError(w, http.StatusNotFound, "model_not_available",
@@ -1054,9 +1087,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 于是点一个坏模型就把单账号池冷 10 分钟（1109 glm-5.3-flash 实测）。
 			// 统一走 handleUpstreamError 分类，和流式路径保持同一套判据。
 			if h.handleUpstreamError(acct, model, aerr) {
-				writeOpenAIError(w, http.StatusNotFound, "model_not_available",
-					"model "+model+" is not available: "+truncateMsg(aerr.Error(), 200))
-				return
+				// 模型级错误：还有没试过的健康账号就先换号（多账号时 B 可能
+				// 有权限），全判死才给客户端明确答复。
+				if !h.hasFreshCandidate(model, tried) {
+					writeOpenAIError(w, http.StatusNotFound, "model_not_available",
+						"model "+model+" is not available: "+truncateMsg(aerr.Error(), 200))
+					return
+				}
 			}
 			continue
 		}
