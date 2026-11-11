@@ -499,6 +499,13 @@ func (h *Handler) probeUnknownAsync() {
 
 // hasFreshCandidate 报告是否还有没试过、健康、且未被判定「该模型不可用」的
 // 账号（上游 #11：模型级错误先换号，全部候选判死才 404）。
+// isHeartbeatUnavailable 报告心跳端点在上游环境不存在（APIG.0101 路由未发布）。
+// 此时并发闸没启用，应降级为无心跳直连而不是换号。
+func isHeartbeatUnavailable(err error) bool {
+	low := strings.ToLower(err.Error())
+	return strings.Contains(low, "apig.0101") || strings.Contains(low, "does not exist or has not been published")
+}
+
 func (h *Handler) hasFreshCandidate(model string, tried map[string]bool) bool {
 	for _, acct := range h.cfg.Pool.Accounts() {
 		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
@@ -913,10 +920,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.SessionHeartbeat {
 			s, sessErr := acct.Client.BeginChatSession(r.Context(), cred)
 			if sessErr != nil {
-				h.cfg.Pool.ReleaseLock(acct.Name)
-				log.Printf("chat-session busy rejected account=%s model=%s: %v", acct.Name, model, sessErr)
-				lastErr = sessErr
-				continue
+				if isHeartbeatUnavailable(sessErr) {
+					// 心跳接口在上游环境不存在（APIG.0101，2026-11-12 实测）：
+					// 这套并发闸没启用，静默降级为无心跳直连。
+					log.Printf("chat-session heartbeat unavailable (proceeding without) account=%s: %v", acct.Name, sessErr)
+				} else {
+					h.cfg.Pool.ReleaseLock(acct.Name)
+					log.Printf("chat-session busy rejected account=%s model=%s: %v", acct.Name, model, sessErr)
+					lastErr = sessErr
+					continue
+				}
 			}
 			sess = s
 		}
