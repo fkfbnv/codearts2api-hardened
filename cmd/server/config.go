@@ -52,6 +52,10 @@ type Config struct {
 	// MaxBodyMB 单个 chat 请求体上限（MB，默认 32）。1107 实测 8MB 会在长会话 +
 	// 图片 base64 时 413；前置 nginx/网关承受力不同，故可配。
 	MaxBodyMB int `json:"max_body_mb"`
+	// SessionHeartbeat 直连路径启用并发会话心跳（默认 true）。上游每账号 3 路
+	// 并发、闸门只认 chat-session/heartbeat 的 busy/idle；不开会话槽位泄漏，
+	// 连发几个请求就撞 TM.00001041。测试环境可关。
+	SessionHeartbeat bool `json:"session_heartbeat"`
 	// CatalogCacheFile 模型目录缓存文件（默认与 state_file 同目录 models-cache.json）。
 	// 落盘后重启可先读缓存，不必冷启动就打上游三路发现。
 	CatalogCacheFile string `json:"catalog_cache_file"`
@@ -318,6 +322,7 @@ func (c *Config) normalize() error {
 	}
 	if c.MaxBodyMB <= 0 {
 		c.MaxBodyMB = 32
+	c.SessionHeartbeat = true
 	}
 	if c.CatalogCacheFile == "" {
 		dir := filepath.Dir(c.StateFile)

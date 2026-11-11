@@ -43,6 +43,9 @@ type Config struct {
 	// 上游长会话 + 图片 base64 很容易顶破 8MB（1107 事故），32MB 是实测可用值；
 	// 但不同部署环境（前置 nginx / 网关）承受力不同，所以做成配置。
 	MaxBodyBytes int64
+	// SessionHeartbeat 直连路径启用并发会话心跳（busy/idle，见 upstream/session.go）。
+	// 上游每账号 3 路并发、只认心跳不认请求结束；测试/无上游环境关闭。
+	SessionHeartbeat bool
 	// DefaultModel 未指定模型时的默认值。
 	DefaultModel  string
 	ConvStateFile string
@@ -903,6 +906,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			SecretAccessKey: secretAccessKey,
 			SecurityToken:   token,
 		}
+		// 并发会话心跳（session.go）：先 busy 登记槽位，对话请求带同一个
+		// User-Session-Id，结束时 idle 注销。抢不到会话 = 该账号并发真满，
+		// 属请求级拥塞：换号，不冷却（规则 5）。
+		var sess *upstream.ChatSession
+		if h.cfg.SessionHeartbeat {
+			s, sessErr := acct.Client.BeginChatSession(r.Context(), cred)
+			if sessErr != nil {
+				h.cfg.Pool.ReleaseLock(acct.Name)
+				log.Printf("chat-session busy rejected account=%s model=%s: %v", acct.Name, model, sessErr)
+				lastErr = sessErr
+				continue
+			}
+			sess = s
+		}
 		chatOpts := upstream.ChatOptions{
 			ReasoningEffort: req.ReasoningEffort,
 			MaxTokens:       req.MaxTokens,
@@ -910,6 +927,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			TopP:            req.TopP,
 			Tools:           tools,
 			ToolChoice:      nativeToolChoice(req.ToolChoice),
+		}
+		if sess != nil {
+			chatOpts.UserSessionID = sess.ID()
 		}
 		// 上游并发会话/TPM 排队是瞬时的。对齐 CodeArts Agent IDE
 		// 参考实现：默认每 10s 重试同一账号，最多 180 次（30min）。
@@ -961,6 +981,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if serr != nil {
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
+			sess.Stop()                       // 心跳会话一并注销
 			if isParamInvalidError(serr) {
 				// Client request-param problem: rotating accounts yields the same 400,
 				// and cooling accounts takes down the whole pool for minutes.
@@ -1018,6 +1039,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}, usage)
 			rc.Close()
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
+			sess.Stop()                       // 心跳会话注销（idle 在最后一次 busy 之后）
 			if werr != nil {
 				log.Printf("chat stream account=%s error: %v", acct.Name, werr)
 				// 首帧就是错误：HTTP 头尚未写出，可以回真正的状态码 + JSON。
@@ -1075,6 +1097,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		comp, aerr := upstream.AggregateRaw(rc)
 		rc.Close()
 		h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
+		sess.Stop()                       // 心跳会话注销
 		if aerr != nil {
 			if isParamInvalidError(aerr) {
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",

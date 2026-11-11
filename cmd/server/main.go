@@ -104,6 +104,7 @@ func main() {
 		}(),
 		QueueMaxAttempts: cfg.QueueMaxAttempts,
 		MaxBodyBytes:     int64(cfg.MaxBodyMB) << 20,
+		SessionHeartbeat: cfg.SessionHeartbeat,
 		ConvStateFile:    cfg.StateFile + ".chats.json",
 		WatchInfo: map[string]any{
 			"enabled":              cfg.Watch.Enabled,

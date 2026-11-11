@@ -107,8 +107,9 @@ type Client struct {
 	streamHTTP *http.Client // SSE 长流，无总超时
 
 	// 上游主机，生产固定为华为云；测试可替换为 httptest 服务。
-	snapBase    string
-	benefitBase string
+	snapBase        string
+	snapManagerBase string
+	benefitBase     string
 	// chatURL chat-completions 完整地址覆盖（测试注入用，留空走 snapBase）。
 	chatURL string
 
@@ -139,8 +140,9 @@ func New(timeout time.Duration) *Client {
 	c := &Client{
 		http:        &http.Client{Timeout: timeout, Transport: tr},
 		streamHTTP:  &http.Client{Transport: tr},
-		snapBase:    SnapEngineApiHost,
-		benefitBase: BenefitHost,
+		snapBase:        SnapEngineApiHost,
+		snapManagerBase: SnapManagerHost,
+		benefitBase:     BenefitHost,
 		srcFail:     map[string]time.Time{},
 	}
 	return c
@@ -391,6 +393,9 @@ type ChatMessage struct {
 
 // ChatOptions 是需要原样传给 OpenAI 兼容上游的可选生成参数。
 type ChatOptions struct {
+	// UserSessionID 并发会话心跳登记的 id；非空时对话请求带同一个
+	// User-Session-Id 头（见 session.go）。
+	UserSessionID string
 	ReasoningEffort string
 	MaxTokens       *int
 	Temperature     *float64
@@ -458,7 +463,7 @@ func (c *Client) ChatStream(ctx context.Context, chatID string, messages []ChatM
 // ChatStreamWithOptions 在基础聊天请求上附加推理等级与采样参数。
 func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions, benefit bool) (io.ReadCloser, error) {
 	body := chatBodyV2(chatID, messages, model, opts)
-	return c.sendModelChatV2(ctx, body, model, traceID, cred, chatID, sessionIDFor(chatID), benefit)
+	return c.sendModelChatV2(ctx, body, model, traceID, cred, chatID, sessionIDFor(chatID), opts.UserSessionID, benefit)
 }
 
 // chatBodyV2 组装 /api/v2/chat/completions 请求体（原生 OpenAI 形状）。
@@ -532,7 +537,7 @@ func sessionIDFor(chatID string) string {
 // benefit=true 时追加 maas_type: benefit（限时福利模型路由），该头在签名前设置，
 // 计入 SignedHeaders。
 func (c *Client) SendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken string, benefit bool) (io.ReadCloser, error) {
-	return c.sendChatV2(ctx, body, traceID, cred, userToken, "", "", benefit)
+	return c.sendChatV2(ctx, body, traceID, cred, userToken, "", "", "", benefit)
 }
 
 // ProbeModel sends the same minimal chat used for model availability checks.
@@ -541,7 +546,7 @@ func (c *Client) ProbeModel(ctx context.Context, model string, cred SignCredenti
 		"stream":   true,
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	}
-	return c.sendModelChatV2(ctx, body, model, "", cred, "", "", benefit)
+	return c.sendModelChatV2(ctx, body, model, "", cred, "", "", "", benefit)
 }
 
 type chatModelKey struct {
@@ -549,7 +554,7 @@ type chatModelKey struct {
 	benefit bool
 }
 
-func (c *Client) sendModelChatV2(ctx context.Context, body map[string]any, model, traceID string, cred SignCredential, chatID, sessionID string, benefit bool) (io.ReadCloser, error) {
+func (c *Client) sendModelChatV2(ctx context.Context, body map[string]any, model, traceID string, cred SignCredential, chatID, sessionID, userSessionID string, benefit bool) (io.ReadCloser, error) {
 	canonical := CanonicalModel(model)
 	lower := strings.ToLower(canonical)
 	key := chatModelKey{id: lower, benefit: benefit}
@@ -562,7 +567,7 @@ func (c *Client) sendModelChatV2(ctx context.Context, body map[string]any, model
 	}
 
 	body["model"] = first
-	rc, err := c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionID, benefit)
+	rc, err := c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionID, userSessionID, benefit)
 	if err == nil || alternate == first || !isModelIDError(err.Error()) {
 		return rc, err
 	}
@@ -570,7 +575,7 @@ func (c *Client) sendModelChatV2(ctx context.Context, body map[string]any, model
 	// InferHub can report an ID spelling mismatch as a permission error.
 	// Retry once with the other spelling on the same account and route.
 	body["model"] = alternate
-	rc, retryErr := c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionID, benefit)
+	rc, retryErr := c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionID, userSessionID, benefit)
 	if retryErr == nil {
 		c.chatModelIDs.Store(key, alternate)
 	} else if IsModelAccessErrorMessage(err.Error()) && isModelIDError(retryErr.Error()) {
@@ -593,7 +598,7 @@ func isModelIDError(message string) bool {
 //
 // chatID/sessionID 作为请求亲和与 prompt cache 标识（不代替 messages 里的语义历史）。
 // benefit 由调用方按账号判定，maas_type 在签名前写入，计入 SignedHeaders。
-func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, chatID, sessionID string, benefit bool) (io.ReadCloser, error) {
+func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, chatID, sessionID, userSessionID string, benefit bool) (io.ReadCloser, error) {
 	raw, _ := json.Marshal(body)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatEndpoint(), bytes.NewReader(raw))
 	if err != nil {
@@ -611,6 +616,9 @@ func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID st
 	}
 	if sessionID != "" {
 		httpReq.Header.Set("Session-Id", sessionID)
+	}
+	if userSessionID != "" {
+		httpReq.Header.Set("User-Session-Id", userSessionID)
 	}
 	resp, err := c.streamHTTP.Do(httpReq)
 	if err != nil {
