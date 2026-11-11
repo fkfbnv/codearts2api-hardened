@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"time"
 
 	"codearts2api/internal/auth"
@@ -69,10 +70,20 @@ func main() {
 	}
 	body["model"] = *model
 
+	ak, sk := acct.AccessKeyID, acct.SecretAccessKey
+	tok := acct.CloudDragonTok
+	// 允许用环境变量覆盖为永久 AK/SK（CLI 授权用的那一对），用于对比凭据类型的影响。
+	if v := os.Getenv("CODEARTS_CLI_AK"); v != "" {
+		ak = v
+	}
+	if v := os.Getenv("CODEARTS_CLI_SK"); v != "" {
+		sk = v
+		tok = "" // 永久 AK/SK 不带 security token
+	}
 	cred := upstream.SignCredential{
-		AccessKeyID:     acct.AccessKeyID,
-		SecretAccessKey: acct.SecretAccessKey,
-		SecurityToken:   acct.CloudDragonTok,
+		AccessKeyID:     ak,
+		SecretAccessKey: sk,
+		SecurityToken:   tok,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -98,7 +109,7 @@ func main() {
 			v2["not_allow_external_model"] = true
 			v2["task_parameters"] = map[string]any{"ide": "CodeArts Agent"}
 		}
-		rc, err2 = c.SendChatV2(ctx, v2, "diag", cred, acct.CloudDragonTok, *benefit)
+		rc, err2 = c.SendChatV2(ctx, v2, "diag", cred, tok, *benefit)
 	} else {
 		rc, err2 = c.SendChatLegacy(ctx, body, "diag", cred, acct.CloudDragonTok, *agentType)
 	}

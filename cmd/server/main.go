@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"codearts2api/internal/auth"
+	"codearts2api/internal/cli"
 	"codearts2api/internal/pool"
 	"codearts2api/internal/scheduler"
 	"codearts2api/internal/server"
@@ -59,6 +60,25 @@ func main() {
 		log.Printf("catalog cache loaded from %s", cfg.CatalogCacheFile)
 	}
 
+	// CLI 后端：确保 codearts serve 在线（不在线就用 AK/SK 拉起）。
+	var cliClient *cli.Client
+	if cfg.CLIBackend.Enabled {
+		serveCfg := cli.ServeConfig{
+			Exe:         cfg.CLIBackend.CodeartsExe,
+			Endpoint:    cfg.CLIBackend.Endpoint,
+			Credentials: cfg.CLIBackend.CredentialsFile,
+			LogPath:     cfg.StateFile + ".cli-serve.log",
+		}
+		if err := cli.EnsureServe(context.Background(), serveCfg); err != nil {
+			log.Printf("cli backend unavailable: %v (falling back to direct models only)", err)
+		} else {
+			timeout := time.Duration(cfg.CLIBackend.TimeoutSeconds) * time.Second
+			cliClient = cli.New(cfg.CLIBackend.Endpoint, timeout)
+			log.Printf("cli backend ready: %s provider=%s models=%d",
+				cfg.CLIBackend.Endpoint, cfg.CLIBackend.Provider, len(cfg.CLIBackend.Models))
+		}
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:              p,
 		Enabled:           cfg.Watch.Enabled,
@@ -100,6 +120,10 @@ func main() {
 		OAuthClient:       upstream.New(15 * time.Second),
 		LoginConfig:       loginConfig(cfg),
 		OAuthCallbackHost: cfg.OAuthCallbackHost,
+		CLI:               cliClient,
+		CLIProvider:       cfg.CLIBackend.Provider,
+		CLIAgent:          cfg.CLIBackend.Agent,
+		CLIModels:         cfg.CLIBackend.Models,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

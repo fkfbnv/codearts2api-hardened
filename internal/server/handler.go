@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	crand "crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -14,11 +15,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"codearts2api/internal/auth"
+	"codearts2api/internal/cli"
 	"codearts2api/internal/pool"
 	"codearts2api/internal/upstream"
 )
@@ -52,6 +55,16 @@ type Config struct {
 	LoginConfig upstream.LoginConfig
 	// OAuthCallbackHost 可选：覆盖授权链接回调 host（如 https://oneapi.example.com/codearts）。
 	OAuthCallbackHost string
+
+	// CLI 官方客户端后端（codearts serve / opencode API）。
+	//
+	// 背景：官方对 snap-access 裸 chat 调用加了传输层加密，直调已用模型一律
+	// TM.000010051；CLI 内部走加密通道可用全部模型。因此命中 CLIModels 的模型
+	// 转给 CLI，其余仍走原直连路径。
+	CLI         *cli.Client
+	CLIProvider string            // 例如 huaweicloud-maas
+	CLIAgent    string            // 例如 build
+	CLIModels   map[string]string // 小写 OpenAI 模型 ID -> CLI modelID
 }
 
 var dynamicModelsCache struct {
@@ -416,6 +429,28 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // modelList 动态获取模型列表并包装成 OpenAI 格式。
 func (h *Handler) modelList() []map[string]any {
 	entries := modelEntries(h.fetchDynamicModels())
+	// CLI 后端能用的模型单独补进列表：它们不在直连可用目录里（直连对这些模型
+	// 只会回 TM.000010051），但对客户端必须可见。
+	if len(h.cfg.CLIModels) > 0 {
+		have := make(map[string]bool, len(entries))
+		for _, e := range entries {
+			if id, ok := e["id"].(string); ok {
+				have[strings.ToLower(id)] = true
+			}
+		}
+		extra := make([]string, 0, len(h.cfg.CLIModels))
+		for id := range h.cfg.CLIModels {
+			if !have[id] {
+				extra = append(extra, id)
+			}
+		}
+		sort.Strings(extra)
+		for _, id := range extra {
+			entries = append(entries, map[string]any{
+				"id": id, "object": "model", "owned_by": "codearts-cli",
+			})
+		}
+	}
 	// 过滤掉「已知不可用」的模型：这些条目在客户端点开就是 404 / benefit not
 	// found，列出来只会误导。必须作用在最终条目上——静态兜底表也会补位，
 	// 只在动态结果上过滤会让被下架的模型又从静态表冒出来。
@@ -751,6 +786,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if affinity == "" {
 		affinity = r.Header.Get("X-Session-Id")
+	}
+	// 命中 CLI 后端的模型走 codearts serve；其余保持原直连路径。
+	if cliModel, ok := h.cliModelFor(req.Model); ok {
+		h.chatViaCLI(w, r, req, cliModel, affinity)
+		return
 	}
 	req.ConversationID = conversationIDFor(req, affinity)
 
@@ -1402,4 +1442,159 @@ func (h *Handler) saveChats() {
 		return
 	}
 	_ = os.Rename(h.cfg.ConvStateFile+".tmp", h.cfg.ConvStateFile)
+}
+
+// ---------------------------------------------------------------------------
+// CLI 后端（codearts serve）
+// ---------------------------------------------------------------------------
+
+// cliModelFor 判断该模型是否应由 CLI 后端处理，并返回 CLI 侧 modelID。
+func (h *Handler) cliModelFor(model string) (string, bool) {
+	if h.cfg.CLI == nil || len(h.cfg.CLIModels) == 0 {
+		return "", false
+	}
+	key := strings.ToLower(strings.TrimSpace(model))
+	if key == "" {
+		key = strings.ToLower(h.cfg.DefaultModel)
+	}
+	id, ok := h.cfg.CLIModels[key]
+	if !ok {
+		return "", false
+	}
+	return id, true
+}
+
+// chatViaCLI 把 OpenAI 请求转成 codearts serve 的 session/message 调用。
+//
+// 说明：CLI 是 agent 内核，回复是纯文本（不返回 tool_calls）。因此 CLI 路径
+// 不支持 OpenAI 工具调用，需要工具的场景请回退到直连模型（GLM-5.2）。
+func (h *Handler) chatViaCLI(w http.ResponseWriter, r *http.Request, req *chatRequest, cliModel, affinity string) {
+	convID := conversationIDFor(req, affinity)
+	prompt := promptFromMessages(req.Messages)
+	ctx, cancel := context.WithTimeout(r.Context(), 300*time.Second)
+	defer cancel()
+
+	res, err := h.cfg.CLI.Chat(ctx, cli.ChatRequest{
+		ConversationID: convID,
+		Provider:       h.cfg.CLIProvider,
+		Model:          cliModel,
+		Agent:          h.cfg.CLIAgent,
+		Prompt:         prompt,
+	})
+	if err != nil {
+		log.Printf("cli chat failed model=%s: %v", cliModel, err)
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "codearts cli: "+truncateMsg(err.Error(), 300))
+		return
+	}
+
+	chatID := convID
+	if !validChatID(chatID) {
+		chatID = randHex(32)
+	}
+	w.Header().Set("X-Codearts-Chat-Id", chatID)
+	if req.Stream {
+		streamCLIText(w, req.Model, res.Text)
+		return
+	}
+	writeJSON(w, http.StatusOK, buildCompletion(req.Model, "", res.Text, nil, "stop", chatID, usageEstimateText(prompt, res.Text)))
+}
+
+// promptFromMessages 把 OpenAI 消息序列拍成 CLI 能理解的单段 prompt。
+// CLI 自己维护会话历史（同一 conversation 复用 session），这里保留角色标记，
+// 便于模型区分系统指令/历史/工具结果。
+func promptFromMessages(msgs []openAIMessage) string {
+	var sb strings.Builder
+	for _, m := range msgs {
+		if m.Text == "" && len(m.ToolCalls) == 0 {
+			continue
+		}
+		switch m.Role {
+		case "system":
+			sb.WriteString("[系统]\n")
+		case "assistant":
+			sb.WriteString("[助手]\n")
+		case "tool":
+			sb.WriteString("[工具结果]\n")
+		default:
+			sb.WriteString("[用户]\n")
+		}
+		if m.Text != "" {
+			sb.WriteString(m.Text)
+			if !strings.HasSuffix(m.Text, "\n") {
+				sb.WriteString("\n")
+			}
+		}
+		for _, c := range m.ToolCalls {
+			sb.WriteString("调用工具 " + c.Name + "(" + c.Arguments + ")\n")
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// streamCLIText 把完整文本按块伪流式返回（CLI 不提供增量事件给这条路径）。
+func streamCLIText(w http.ResponseWriter, model, text string) {
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	fl, _ := w.(http.Flusher)
+	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+
+	send := func(delta map[string]any, fin string) bool {
+		choice := map[string]any{"index": 0, "delta": delta}
+		if fin != "" {
+			choice["finish_reason"] = fin
+		}
+		chunk := map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(),
+			"model": model, "choices": []any{choice},
+		}
+		raw, _ := json.Marshal(chunk)
+		if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
+			return false
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		return true
+	}
+
+	if !send(map[string]any{"role": "assistant"}, "") {
+		return
+	}
+	runes := []rune(text)
+	const step = 32
+	for i := 0; i < len(runes); i += step {
+		end := i + step
+		if end > len(runes) {
+			end = len(runes)
+		}
+		if !send(map[string]any{"content": string(runes[i:end])}, "") {
+			return
+		}
+	}
+	send(map[string]any{}, "stop")
+	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	if fl != nil {
+		fl.Flush()
+	}
+}
+
+// usageEstimateText 粗略估算 token（CLI 路径拿不到可信 usage）。
+func usageEstimateText(prompt, out string) map[string]any {
+	pt := len([]rune(prompt)) / 2
+	if pt < 1 {
+		pt = 1
+	}
+	ot := len([]rune(out)) / 2
+	if ot < 1 {
+		ot = 1
+	}
+	return map[string]any{
+		"prompt_tokens":     pt,
+		"completion_tokens": ot,
+		"total_tokens":      pt + ot,
+	}
 }

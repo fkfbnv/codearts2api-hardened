@@ -67,6 +67,20 @@ type Config struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
 	} `json:"upstream"`
 
+	// CLIBackend 官方 CLI 后端（codearts serve / opencode API）。
+	// 官方对裸 chat 调用加了传输层加密，直调已用模型一律 TM.000010051；
+	// CLI 内部走加密通道可用全部模型，因此把命中 models 的请求转给它。
+	CLIBackend struct {
+		Enabled         bool              `json:"enabled"`
+		Endpoint        string            `json:"endpoint"`
+		Provider        string            `json:"provider"`
+		Agent           string            `json:"agent"`
+		CodeartsExe     string            `json:"codearts_exe"`
+		CredentialsFile string            `json:"credentials_file"`
+		TimeoutSeconds  int               `json:"timeout_seconds"`
+		Models          map[string]string `json:"models"` // 小写 OpenAI ID -> CLI modelID
+	} `json:"cli_backend"`
+
 	SoftRateDur    time.Duration
 	ErrCooldownDur time.Duration
 }
@@ -91,6 +105,25 @@ func Default() *Config {
 	c.Upstream.TimeoutSeconds = 120
 	c.BenefitAutoClaim = true // 不领取时福利模型调用必然失败（benefit not found）
 	c.CreditsAutoClaim = true
+
+	// CLI 后端默认开启：直连对 DeepSeek/GLM-5.3/Kimi 等模型已无权，只有 CLI 能用。
+	c.CLIBackend.Enabled = true
+	c.CLIBackend.Endpoint = "http://127.0.0.1:4096"
+	c.CLIBackend.Provider = "huaweicloud-maas"
+	c.CLIBackend.Agent = "build"
+	c.CLIBackend.CodeartsExe = `C:\Users\liang\.codeartsdoer\installers\bin\codearts.exe`
+	c.CLIBackend.CredentialsFile = "./cli-credentials.json"
+	c.CLIBackend.TimeoutSeconds = 300
+	c.CLIBackend.Models = map[string]string{
+		"deepseek-v4.1-flash":      "deepseek-v4.1-flash",
+		"deepseek-v4.1-flash-1017": "deepseek-v4.1-flash-1017",
+		"glm-5.3":                  "glm-5.3",
+		"glm-5.3-flash":            "glm-5.3-flash",
+		"kimi-k3":                  "kimi-k3",
+		"kimi-k3.1-pro":            "kimi-k3.1-pro",
+		"openpangu-2.0-flash":      "openpangu-2.0-flash",
+		"openpangu-2.0-pro":        "openpangu-2.0-pro",
+	}
 	return c
 }
 
