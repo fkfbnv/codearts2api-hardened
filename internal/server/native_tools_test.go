@@ -195,6 +195,8 @@ func TestChatCompletionsSignsBenefitHeaderForGLM53Flash(t *testing.T) {
 	defer upstreamServer.Close()
 
 	a := auth.New("benefit-account", "tester", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
+	// 福利通道已下线、种子已移除；maas_type 签名机制仍在，用显式目录登记验证。
+	upstream.SetAccountModels("benefit-account", []upstream.ModelInfo{{ID: "glm-5.3-flash", Benefit: true}})
 	p, err := pool.New([]*auth.Auth{a}, pool.Config{MaxConcurrent: 1}, "")
 	if err != nil {
 		t.Fatal(err)

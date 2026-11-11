@@ -50,11 +50,11 @@ type ModelInfo struct {
 	Desc    string `json:"desc,omitempty"`
 }
 
-// 冷启动种子：福利套餐轮换后新增的模型在首次发现前也要走福利路由，
-// 少带一次头就是一次 404，宁可多带。发现结果只会在此基础上增补。
-var seedBenefitModels = []string{
-	"deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "glm-5.3-flash",
-}
+// 福利（opengw benefit）通道 2026-11-11 起上游整体下线：gateway/config 与
+// benefit/claim 一律 4000 invalid channel（本机日志 + 多个第三方实现交叉印证，
+// 见 E:\修复\码道反代生态调研-20261111.md §二.2）。因此不再做福利发现、不再
+// 维护冷启动福利种子；maas_type 路由机制保留，目录里带 Benefit 标记的条目
+// （历史缓存/显式登记）仍按原样路由。
 
 // 内置模型种子（大小写归一用，不标记福利）。
 var seedKnownModels = []string{
@@ -62,14 +62,6 @@ var seedKnownModels = []string{
 	"OpenPangu-2.0-Pro", "OpenPangu-2.0-Flash",
 	"Qwen3-VL-235B", "Qwen3.5-397B-A17B-VL", "Qwen3.6-27B-VL",
 }
-
-var seedBenefit = func() map[string]bool {
-	m := make(map[string]bool, len(seedBenefitModels))
-	for _, id := range seedBenefitModels {
-		m[strings.ToLower(id)] = true
-	}
-	return m
-}()
 
 // accountCatalog 一个账号的模型目录快照。
 type accountCatalog struct {
@@ -90,8 +82,8 @@ var catalog = struct {
 }{accounts: map[string]*accountCatalog{}, known: map[string]string{}}
 
 func init() {
-	catalog.known = make(map[string]string, len(seedKnownModels)+len(seedBenefitModels))
-	for _, id := range append(append([]string{}, seedKnownModels...), seedBenefitModels...) {
+	catalog.known = make(map[string]string, len(seedKnownModels))
+	for _, id := range seedKnownModels {
 		if _, ok := catalog.known[strings.ToLower(id)]; !ok {
 			catalog.known[strings.ToLower(id)] = id
 		}
@@ -337,11 +329,11 @@ func AccountCatalogStale(accountID string) bool {
 // IsBenefitModel 报告该账号下该模型是否走限时福利路由（大小写不敏感）。
 //
 // 判定顺序：
-//  1. 该账号目录里标了福利 → true（发现结果优先于种子）
+//  1. 该账号目录里标了福利 → true（发现结果优先）
 //  2. 该账号目录里有但没有标福利 → false：它已经以内置/agent-center 身份注册，
 //     套餐轮换后福利模型转正就靠这条摘掉 maas_type 头
-//  3. 目录里没有这个模型（尚未发现、福利来源失败或未领取）→ 回退冷启动种子，
-//     少带一次头就是一次 InferHub.002002009.404，宁可多带
+//  3. 目录里没有这个模型 → false。福利通道 2026-11-11 下线后不再有冷启动
+//     种子；未登记的模型一律按普通路由发。
 func IsBenefitModel(accountID, model string) bool {
 	key := strings.ToLower(strings.TrimSpace(model))
 	if key == "" {
@@ -357,7 +349,7 @@ func IsBenefitModel(accountID, model string) bool {
 			return false
 		}
 	}
-	return seedBenefit[key]
+	return false
 }
 
 // lookupKnownModel 按小写 ID 查精确模型 ID（种子 + 已发现模型）。
@@ -435,9 +427,12 @@ func betterModel(a, b ModelInfo) bool {
 	return a.ID != strings.ToLower(a.ID) && b.ID == strings.ToLower(b.ID)
 }
 
-// FetchModels 拉取指定账号当前可用模型（三路合并），并写入该账号的模型目录。
+// FetchModels 拉取指定账号当前可用模型（agent-center + builtin 两路合并），
+// 并写入该账号的模型目录。
 //
-// 任一路失败只记日志不阻断：福利接口不可用时仍能拿到内置模型。
+// 福利网关（opengw benefit）来源已于 2026-11-11 上游下线，不再拉取、不再
+// 自动领取；需要手动重试领取用 `codearts2api models -claim`（走 ClaimBenefit）。
+// 任一路失败只记日志不阻断。
 func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 	if acct == nil {
 		return nil, fmt.Errorf("account required for model fetch")
@@ -454,26 +449,16 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 	} else {
 		sets = append(sets, infos)
 	}
-	builtinOK := false
 	if infos, err := c.fetchBuiltinModels(accountID, cred); err != nil {
 		Log("builtin models: %v", err)
 	} else {
-		builtinOK = true
-		sets = append(sets, infos)
-	}
-	benefitOK := false
-	if infos, err := c.fetchBenefitModels(accountID, cred); err != nil {
-		Log("benefit models: %v", err)
-	} else {
-		benefitOK = true
 		sets = append(sets, infos)
 	}
 	out := MergeModels(sets...)
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
-	// 福利来源失败但内置来源成功：保留上一轮已确认的福利条目，别把标记弄丢。
-	setAccountModels(accountID, out, builtinOK && !benefitOK)
+	setAccountModels(accountID, out, false)
 	persistCatalog()
 	return out, nil
 }
@@ -659,73 +644,3 @@ func (c *Client) ClaimBenefit(cred SignCredential) error {
 	return nil
 }
 
-// fetchBenefitModels 拉取限时福利模型（gateway/config），返回结果整体标记 Benefit。
-func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]ModelInfo, error) {
-	key := accountID + "|benefit"
-	if c.srcBlocked(key) {
-		return nil, fmt.Errorf("benefit source backoff")
-	}
-	if c.claimAuto.Load() {
-		if err := c.ClaimBenefit(cred); err != nil {
-			Log("benefit claim: %v", err)
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.benefitURL(EpBenefitConfig), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Language", "zh-cn")
-	if cred.SecurityToken != "" {
-		req.Header.Set("X-Security-Token", cred.SecurityToken)
-	}
-	signRequest(req, []byte{}, cred)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		c.noteSrcFail(key)
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if resp.StatusCode >= 400 {
-		c.noteSrcFail(key)
-		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: EpBenefitConfig}
-	}
-	var out struct {
-		ErrorCode string `json:"error_code"`
-		Result    struct {
-			BaseURL string `json:"base_url"`
-			Models  []struct {
-				ModelID       string `json:"model_id"`
-				ModelName     string `json:"model_name"`
-				ModelDesc     string `json:"model_desc"`
-				ContextWindow int64  `json:"context_window"`
-				MaxTokens     int64  `json:"max_tokens"`
-			} `json:"models"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		c.noteSrcFail(key)
-		return nil, fmt.Errorf("parse benefit config: %w", err)
-	}
-	if out.ErrorCode != "0000" {
-		c.noteSrcFail(key)
-		return nil, fmt.Errorf("gateway/config error_code=%s", out.ErrorCode)
-	}
-	c.clearSrcFail(key)
-	infos := make([]ModelInfo, 0, len(out.Result.Models))
-	for _, m := range out.Result.Models {
-		id := firstNonEmpty(m.ModelID, m.ModelName)
-		if id == "" {
-			continue
-		}
-		infos = append(infos, ModelInfo{
-			ID: id, Name: id,
-			ContextWindow: m.ContextWindow, MaxTokens: m.MaxTokens, Desc: m.ModelDesc,
-			Benefit: true,
-		})
-	}
-	return infos, nil
-}

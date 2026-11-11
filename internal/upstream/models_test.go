@@ -46,12 +46,9 @@ func TestBenefitIsPerAccount(t *testing.T) {
 	if IsBenefitModel("acct-b", "glm-5.2") {
 		t.Error("内置模型不应走福利路由")
 	}
-	// 目录未知的账号：回退冷启动种子（宁可带头，避免未注册模型 404）。
-	if !IsBenefitModel("acct-unknown", "glm-5.3-flash") {
-		t.Error("目录未发现时应回退种子判定福利模型")
-	}
-	if IsBenefitModel("acct-unknown", "glm-5.2") {
-		t.Error("种子之外的模型不得误判为福利")
+	// 目录未知的账号：福利通道 2026-11-11 下线后无冷启动种子，一律按普通路由。
+	if IsBenefitModel("acct-unknown", "glm-5.3-flash") {
+		t.Error("通道下线后未知账号不应再回退种子判福利")
 	}
 }
 
@@ -90,9 +87,9 @@ func TestDiscoveredCatalogOverridesSeed(t *testing.T) {
 	if IsBenefitModel("acct-promoted", "GLM-5.2") {
 		t.Error("内置模型不应走福利路由")
 	}
-	// 目录里查不到的种子模型（福利来源失败/未领取）仍要带头，否则上游按未注册模型拒。
-	if !IsBenefitModel("acct-promoted", "deepseek-v4-pro-0813") {
-		t.Error("目录里没有的种子模型应回退种子判定")
+	// 目录里查不到的模型：通道下线后无种子回退，一律按普通路由。
+	if IsBenefitModel("acct-promoted", "deepseek-v4-pro-0813") {
+		t.Error("通道下线后不应再按种子误判福利")
 	}
 	// 目录明确标了福利 → 优先级最高。
 	SetAccountModels("acct-promoted2", []ModelInfo{{ID: "glm-5.3-flash", Benefit: true}})
@@ -180,13 +177,15 @@ func TestSendChatV2BenefitHeaderSigned(t *testing.T) {
 	}
 }
 
-func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
+// 福利通道 2026-11-11 上游下线后：发现只合并 agent-center + builtin 两路，
+// 不再请求福利网关、不再自动领取（见 models.go 顶部说明）。
+func TestFetchModelsMergesSourcesWithoutBenefit(t *testing.T) {
 	var mu sync.Mutex
-	var claims int
+	var posts int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			mu.Lock()
-			claims++
+			posts++
 			mu.Unlock()
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -204,11 +203,8 @@ func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
 				t.Errorf("builtin 接口需带 Agent-Type: PromptCenter，got=%q", r.Header.Get("Agent-Type"))
 			}
 			_, _ = io.WriteString(w, `{"builtinModels":[{"model_id":"OpenPangu-2.0-Pro","context_window":524288}]}`)
-		case "/api/v1/gateway/config":
-			_, _ = io.WriteString(w, `{"error_code":"0000","result":{"base_url":"https://example.invalid","models":[`+
-				`{"model_id":"glm-5.3-flash","context_window":1048576,"max_tokens":65536}]}}`)
-		case "/api/v1/benefit/claim":
-			_, _ = io.WriteString(w, `{"error_code":"0000","error_msg":""}`)
+		case "/api/v1/gateway/config", "/api/v1/benefit/claim":
+			t.Errorf("福利通道已下线，不应再请求 %s", r.URL.Path)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -224,46 +220,24 @@ func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(infos) != 3 {
-		t.Fatalf("三路合并应得 3 个模型，got=%+v", infos)
+	if len(infos) != 2 {
+		t.Fatalf("两路合并应得 2 个模型，got=%+v", infos)
 	}
-	byID := map[string]ModelInfo{}
 	for _, mi := range infos {
-		byID[strings.ToLower(mi.ID)] = mi
-	}
-	if !byID["glm-5.3-flash"].Benefit {
-		t.Error("福利网关返回的模型应标记 Benefit")
-	}
-	if byID["openpangu-2.0-pro"].Benefit || byID["glm-5.2"].Benefit {
-		t.Error("内置模型不应标记 Benefit")
-	}
-	if byID["glm-5.2"].ContextWindow != 202752 || byID["glm-5.2"].MaxTokens != 8192 {
-		t.Errorf("agent-center 参数未解析：%+v", byID["glm-5.2"])
+		if mi.Benefit {
+			t.Errorf("发现结果不应再含福利标记：%+v", mi)
+		}
 	}
 	mu.Lock()
-	gotClaims := claims
+	posts2 := posts
 	mu.Unlock()
-	// 默认领取：不领取时福利模型在上游一律 benefit not found（实测 2026-09-15），
-	// 所以发现福利模型时必须顺手领取（幂等，与官方客户端行为一致）。
-	if gotClaims != 1 {
-		t.Fatalf("默认应自动领取一次福利（幂等），claims=%d", gotClaims)
+	if posts2 != 0 {
+		t.Fatalf("发现流程是只读的，不应有 POST，posts=%d", posts2)
 	}
-	if !IsBenefitModel("u-merge", "GLM-5.3-FLASH") {
-		t.Error("发现结果应写入该账号目录，供聊天路由判定")
+	if IsBenefitModel("u-merge", "GLM-5.2") {
+		t.Error("内置身份登记的模型不应走福利路由")
 	}
 	if _, ok := AccountModels("u-merge"); !ok {
 		t.Error("发现结果应可读回")
-	}
-
-	// 显式关闭后不得再 POST（该开关是给「不想让服务写账号」的部署留的）。
-	c.SetBenefitAutoClaim(false)
-	if _, err := c.FetchModels(acct); err != nil {
-		t.Fatal(err)
-	}
-	mu.Lock()
-	gotClaims = claims
-	mu.Unlock()
-	if gotClaims != 1 {
-		t.Fatalf("关闭自动领取后不应再提交 claim，claims=%d", gotClaims)
 	}
 }

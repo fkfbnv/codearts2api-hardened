@@ -56,7 +56,7 @@ type Config struct {
 	// 落盘后重启可先读缓存，不必冷启动就打上游三路发现。
 	CatalogCacheFile string `json:"catalog_cache_file"`
 
-	// BenefitAutoClaim 模型发现时自动领取限时福利（默认 true）。
+	// BenefitAutoClaim 已弃用（2026-11-11 福利通道上游下线）：仅保留配置键兼容，不再有任何效果。
 	// 领取是幂等操作（官方客户端打开模型菜单即调用），不领取时福利模型一律
 	// 返回 InferHub.4004.200 benefit not found。置 false 可关掉这个写操作。
 	BenefitAutoClaim bool `json:"benefit_auto_claim"`
@@ -103,7 +103,7 @@ func Default() *Config {
 	c.MaxConcurrent = 1            // 上游单账号最多 3 并发会话但释放慢，串行最稳
 	c.KeepaliveWindow = "10m"      // 新增：保活窗口 10 分钟
 	c.Upstream.TimeoutSeconds = 120
-	c.BenefitAutoClaim = true // 不领取时福利模型调用必然失败（benefit not found）
+	c.BenefitAutoClaim = true // 已弃用，仅兼容旧配置文件
 	c.CreditsAutoClaim = true
 
 	// CLI 后端默认开启：直连对 DeepSeek/GLM-5.3/Kimi 等模型已无权，只有 CLI 能用。

@@ -23,7 +23,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -113,12 +112,6 @@ type Client struct {
 	// chatURL chat-completions 完整地址覆盖（测试注入用，留空走 snapBase）。
 	chatURL string
 
-	// claimAuto 模型发现时是否自动领取限时福利。
-	// 默认开启：不领取时福利模型一律返回 InferHub.4004.200 benefit not found
-	// （实测 2026-09-15），服务商把「领取」做成幂等操作，官方客户端打开模型
-	// 菜单也会调用；关闭后福利模型列表仍在，但调用必然失败。
-	claimAuto atomic.Bool
-
 	// 分来源失败退避：同一账号的 builtin/福利接口打不通时短期内不再重试，
 	// 避免每次 /v1/models 刷新都空等超时。
 	srcMu   sync.Mutex
@@ -146,7 +139,6 @@ func New(timeout time.Duration) *Client {
 		benefitBase: BenefitHost,
 		srcFail:     map[string]time.Time{},
 	}
-	c.claimAuto.Store(true)
 	return c
 }
 
@@ -167,13 +159,6 @@ func (c *Client) chatEndpoint() string {
 	}
 	return c.snapURL(EpChatV2)
 }
-
-// SetBenefitAutoClaim 设置模型发现时是否自动领取限时福利（默认 false）。
-// 关闭时 /v1/models 只读不写，需要领取请显式调用 ClaimBenefit（cmd/models -claim）。
-func (c *Client) SetBenefitAutoClaim(v bool) { c.claimAuto.Store(v) }
-
-// BenefitAutoClaim 报告是否开启自动领取。
-func (c *Client) BenefitAutoClaim() bool { return c.claimAuto.Load() }
 
 // snapURL 拼接 snap-access 主机地址。
 func (c *Client) snapURL(path string) string { return c.snapBase + path }

@@ -34,9 +34,19 @@ func main() {
 		log.Fatalf("no accounts in %s", *authDir)
 	}
 	c := upstream.New(60 * time.Second)
-	c.SetBenefitAutoClaim(*claim)
 	if *claim {
-		log.Printf("benefit auto claim enabled: 将向福利网关提交领取请求")
+		// 福利通道 2026-11-11 上游下线（4000 invalid channel）；保留入口供
+		// 上游恢复时手动验证，失败只记日志不阻断模型发现。
+		for _, a := range auths {
+			cred := upstream.SignCredential{
+				AccessKeyID:     a.AccessKeyID,
+				SecretAccessKey: a.SecretAccessKey,
+				SecurityToken:   a.CloudDragonTok,
+			}
+			if err := c.ClaimBenefit(cred); err != nil {
+				log.Printf("benefit claim %s: %v", a.UserName, err)
+			}
+		}
 	}
 	for _, a := range auths {
 		infos, err := c.FetchModels(a)

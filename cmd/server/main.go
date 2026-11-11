@@ -46,7 +46,6 @@ func main() {
 	}
 
 	c := upstream.New(120 * time.Second)
-	c.SetBenefitAutoClaim(cfg.BenefitAutoClaim)
 
 	// 模型目录落盘缓存：重启后先用磁盘里的目录，过期由后台单飞刷新。
 	upstream.SetCatalogCacheFile(cfg.CatalogCacheFile)
