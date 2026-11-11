@@ -138,12 +138,12 @@ func New(timeout time.Duration) *Client {
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	c := &Client{
-		http:        &http.Client{Timeout: timeout, Transport: tr},
-		streamHTTP:  &http.Client{Transport: tr},
+		http:            &http.Client{Timeout: timeout, Transport: tr},
+		streamHTTP:      &http.Client{Transport: tr},
 		snapBase:        SnapEngineApiHost,
 		snapManagerBase: SnapManagerHost,
 		benefitBase:     BenefitHost,
-		srcFail:     map[string]time.Time{},
+		srcFail:         map[string]time.Time{},
 	}
 	return c
 }
@@ -395,7 +395,7 @@ type ChatMessage struct {
 type ChatOptions struct {
 	// UserSessionID 并发会话心跳登记的 id；非空时对话请求带同一个
 	// User-Session-Id 头（见 session.go）。
-	UserSessionID string
+	UserSessionID   string
 	ReasoningEffort string
 	MaxTokens       *int
 	Temperature     *float64
