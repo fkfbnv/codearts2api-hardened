@@ -13,7 +13,7 @@ import (
 func promptFromMessages(msgs []openAIMessage) string {
 	var sb strings.Builder
 	for _, m := range msgs {
-		if m.Text == "" && len(m.ToolCalls) == 0 {
+		if m.Text == "" && m.Content == nil && len(m.ToolCalls) == 0 {
 			continue
 		}
 		switch m.Role {
@@ -31,6 +31,13 @@ func promptFromMessages(msgs []openAIMessage) string {
 			if !strings.HasSuffix(m.Text, "\n") {
 				sb.WriteString("\n")
 			}
+		}
+		// CLI 通道带不了图片（prompt 是纯文本）。以前图片被静默丢弃，模型
+		// 看到用户在谈截图却收不到图，就会去找/发明读图工具（实测复现：
+		// LocalToolSearch{"query":"select:analyzeImage"} → 连环执行失败）。
+		// 显式声明看不到图，让它直接用文本回答。
+		if m.Content != nil {
+			sb.WriteString("[图片：用户发送了图片附件，本通道无法传图，你看不到图片内容。请基于已有文字直接回答，或用文字向用户说明需要贴出文字内容；不要寻找或调用读图工具。]\n")
 		}
 		for _, c := range m.ToolCalls {
 			sb.WriteString("调用工具 " + c.Name + "(" + c.Arguments + ")\n")
@@ -121,6 +128,7 @@ func toolPrompt(userPrompt string, tools []map[string]any, choice toolChoiceOpen
 	sb.WriteString("\n\n不要自己执行工具，不要读写文件、不要运行命令。需要调用工具时，只输出一个代码块：\n")
 	sb.WriteString("```tool_call\n{\"name\":\"工具名\",\"arguments\":{...}}\n```\n")
 	sb.WriteString("可以输出多个代码块。不需要工具时直接回答，不要输出代码块。\n")
+	sb.WriteString("只能调用上面列出的工具，工具名必须与列表一字不差（区分大小写）。列表里没有的工具（例如图像识别）一律不要发明、不要猜测近似名字，直接用文本向用户说明。\n")
 	if choice.Mode == "required" {
 		sb.WriteString("本轮必须调用工具。\n")
 	}

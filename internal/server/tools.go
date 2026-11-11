@@ -142,6 +142,36 @@ func stripToolWrappers(text string) string {
 	return strings.TrimSpace(replacer.Replace(text))
 }
 
+// filterKnownCalls 丢弃名字不在本次请求 tools 列表里的调用。
+//
+// 提示词模拟的固有风险是模型发明工具名（实测：图片通道不通时输出
+// Analyzelmage / Tool_describe / Tool_call）。这类调用透传给客户端只会
+// 「执行失败」并诱发重试死循环，因此在网关侧按白名单过滤。
+func filterKnownCalls(calls []openAIToolCall, tools []map[string]any) (kept []openAIToolCall, dropped []string) {
+	if len(calls) == 0 || len(tools) == 0 {
+		return calls, nil
+	}
+	known := map[string]bool{}
+	for _, t := range tools {
+		if fn, ok := t["function"].(map[string]any); ok {
+			if n, _ := fn["name"].(string); n != "" {
+				known[n] = true
+			}
+		}
+	}
+	if len(known) == 0 {
+		return calls, nil
+	}
+	for _, c := range calls {
+		if known[c.Name] {
+			kept = append(kept, c)
+		} else {
+			dropped = append(dropped, c.Name)
+		}
+	}
+	return kept, dropped
+}
+
 // toolResponse 把提示词模拟的工具调用转为 OpenAI 结构。一旦存在调用，
 // 上游剩余文本不可信（可能是协议/工具历史复述），因此不作为 content 暴露。
 func toolResponse(text string) (calls []openAIToolCall, content string, found bool) {

@@ -1074,6 +1074,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				finish = "tool_calls"
 			}
 		}
+		if toolsOn && len(calls) > 0 {
+			kept, dropped := filterKnownCalls(calls, req.Tools)
+			if len(dropped) > 0 {
+				log.Printf("dropped unknown tool names model=%s: %v", model, dropped)
+			}
+			if len(kept) > 0 {
+				calls = kept
+				finish = "tool_calls"
+			} else {
+				calls, finish = nil, "stop"
+			}
+		}
 		if len(calls) > 0 {
 			finish = "tool_calls"
 		}
@@ -1505,10 +1517,20 @@ func (h *Handler) chatViaCLI(w http.ResponseWriter, r *http.Request, req *chatRe
 	var calls []openAIToolCall
 	if toolsOn {
 		if c, rest, found := toolResponse(res.Text); found {
-			calls = c
-			content = rest
-			finish = "tool_calls"
-			assignCallIDs(calls)
+			kept, dropped := filterKnownCalls(c, req.Tools)
+			if len(dropped) > 0 {
+				log.Printf("cli dropped unknown tool names model=%s: %v", cliModel, dropped)
+			}
+			if len(kept) > 0 {
+				calls = kept
+				content = rest
+				finish = "tool_calls"
+				assignCallIDs(calls)
+			} else {
+				// 全是发明出来的工具名：不回 tool_calls（否则客户端执行失败并
+				// 死循环），把剥掉调用块后的文本当普通回复。
+				content = strings.TrimSpace(rest)
+			}
 		}
 	}
 	if req.Stream {

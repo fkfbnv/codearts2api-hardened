@@ -26,6 +26,11 @@ type Client struct {
 
 	mu       sync.Mutex
 	sessions map[string]string // conversationID -> CLI session id
+	// lastPrompt 记录每个会话上次发过的完整拍平 prompt。CLI session 自己维护
+	// 历史，而客户端每轮都重发全量 messages；不裁剪的话上下文每轮翻倍
+	// （token 双倍烧、模型看到重复历史容易胡来）。下轮 prompt 若以上次为
+	// 前缀，就只发增量。
+	lastPrompt map[string]string
 }
 
 // New 构造客户端。base 例如 http://127.0.0.1:4096。
@@ -34,9 +39,10 @@ func New(base string, timeout time.Duration) *Client {
 		timeout = 180 * time.Second
 	}
 	return &Client{
-		base:     strings.TrimRight(base, "/"),
-		http:     &http.Client{Timeout: timeout},
-		sessions: map[string]string{},
+		base:       strings.TrimRight(base, "/"),
+		http:       &http.Client{Timeout: timeout},
+		sessions:   map[string]string{},
+		lastPrompt: map[string]string{},
 	}
 }
 
@@ -83,20 +89,35 @@ type Part struct {
 // 会话复用：conversationID 非空且已有 CLI session 时只发送本轮内容，历史由 CLI
 // 维护；否则新建 session 并把完整上下文作为一条 prompt 发送（调用方负责拼装）。
 func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResult, error) {
-	sid, reused := c.session(req.ConversationID)
+	sid, _ := c.session(req.ConversationID)
+	prompt := req.Prompt
+	if sid != "" {
+		// 已有 CLI session：尝试只发增量。历史被改写（前缀不匹配，例如工具
+		// 集变化或客户端重排消息）时弃旧会话、按全量重建。
+		c.mu.Lock()
+		prev, ok := c.lastPrompt[req.ConversationID]
+		c.mu.Unlock()
+		if ok && strings.HasPrefix(req.Prompt, prev) {
+			if delta := strings.TrimSpace(req.Prompt[len(prev):]); delta != "" {
+				prompt = "\n" + delta
+			}
+		} else if ok {
+			c.dropSession(req.ConversationID)
+			sid = ""
+			prompt = req.Prompt
+		}
+	}
 	if sid == "" {
 		var err error
 		sid, err = c.createSession(ctx, req.ConversationID)
 		if err != nil {
 			return nil, err
 		}
-		reused = false
 	}
-	_ = reused
 
 	body := map[string]any{
 		"model": map[string]any{"providerID": req.Provider, "modelID": req.Model},
-		"parts": []any{map[string]any{"type": "text", "text": req.Prompt}},
+		"parts": []any{map[string]any{"type": "text", "text": prompt}},
 	}
 	if req.Agent != "" {
 		body["agent"] = req.Agent
@@ -109,7 +130,8 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResult, error)
 	hr.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(hr)
 	if err != nil {
-		// 会话可能已被 CLI 回收：清掉映射，让下次重建。
+		// 会话可能已被 CLI 回收：清掉映射，让下次重建（连带 lastPrompt，
+		// 否则增量会发进一个没有历史的全新 session）。
 		c.dropSession(req.ConversationID)
 		return nil, err
 	}
@@ -119,6 +141,9 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResult, error)
 		c.dropSession(req.ConversationID)
 		return nil, fmt.Errorf("codearts serve %d: %s", resp.StatusCode, truncate(string(reply), 300))
 	}
+	c.mu.Lock()
+	c.lastPrompt[req.ConversationID] = req.Prompt
+	c.mu.Unlock()
 
 	var parsed struct {
 		Info struct {
@@ -191,6 +216,7 @@ func (c *Client) dropSession(conversationID string) {
 	}
 	c.mu.Lock()
 	delete(c.sessions, conversationID)
+	delete(c.lastPrompt, conversationID)
 	c.mu.Unlock()
 }
 
