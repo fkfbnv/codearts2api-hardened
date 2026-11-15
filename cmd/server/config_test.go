@@ -59,6 +59,46 @@ func TestLoadToleratesExampleConfigComments(t *testing.T) {
 	}
 }
 
+// 心跳开关必须与 max_body_mb 判断解耦。
+//
+// 真实缺陷（2026-11-15 发现）：`c.SessionHeartbeat = true` 曾被误缩进到
+// `if c.MaxBodyMB <= 0 { ... }` 块里。本机 config.json 没写 max_body_mb，
+// 所以碰巧一直是开的；一旦有人写上 max_body_mb，并发闸就会静默关闭，
+// 而且配置里写 session_heartbeat:false 也永远关不掉（被无条件覆盖成 true）。
+func TestSessionHeartbeatIndependentOfMaxBodyMB(t *testing.T) {
+	t.Setenv("CA2A_API_KEY", "test-key")
+
+	cases := []struct {
+		name string
+		json string
+		want bool
+	}{
+		{"都没写：默认开", `{}`, true},
+		{"只写 max_body_mb：仍默认开", `{"max_body_mb": 64}`, true},
+		{"显式关掉", `{"session_heartbeat": false}`, false},
+		{"显式关掉 + max_body_mb", `{"session_heartbeat": false, "max_body_mb": 64}`, false},
+		{"显式打开", `{"session_heartbeat": true, "max_body_mb": 8}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(tc.json), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if cfg.SessionHeartbeat == nil {
+				t.Fatal("normalize 应把 nil 归一成显式值")
+			}
+			if got := *cfg.SessionHeartbeat; got != tc.want {
+				t.Fatalf("session_heartbeat = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestStripJSONCommentsKeepsStrings(t *testing.T) {
 	raw := []byte("{\n" +
 		"  // 行注释\n" +

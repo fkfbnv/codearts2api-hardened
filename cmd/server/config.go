@@ -54,8 +54,13 @@ type Config struct {
 	MaxBodyMB int `json:"max_body_mb"`
 	// SessionHeartbeat 直连路径启用并发会话心跳（默认 true）。上游每账号 3 路
 	// 并发、闸门只认 chat-session/heartbeat 的 busy/idle；不开会话槽位泄漏，
-	// 连发几个请求就撞 TM.00001041。测试环境可关。
-	SessionHeartbeat bool `json:"session_heartbeat"`
+	// 连发几个请求就撞 TM.00001041。测试环境可显式置 false。
+	//
+	// 用 *bool 而不是 bool：bool 分不清「没写」和「写了 false」，而默认值又是
+	// true，导致 false 永远关不掉。这个字段还曾经被误写进
+	// `if c.MaxBodyMB <= 0` 的块里（缩进错位），本机恰好没设 max_body_mb 才
+	// 侥幸生效——一旦有人写 max_body_mb，心跳就会静默关闭。
+	SessionHeartbeat *bool `json:"session_heartbeat,omitempty"`
 	// CatalogCacheFile 模型目录缓存文件（默认与 state_file 同目录 models-cache.json）。
 	// 落盘后重启可先读缓存，不必冷启动就打上游三路发现。
 	CatalogCacheFile string `json:"catalog_cache_file"`
@@ -322,7 +327,12 @@ func (c *Config) normalize() error {
 	}
 	if c.MaxBodyMB <= 0 {
 		c.MaxBodyMB = 32
-	c.SessionHeartbeat = true
+	}
+	// 心跳默认开。必须与 MaxBodyMB 判断彻底分开：这一行曾经被缩进到上面的
+	// `if c.MaxBodyMB <= 0` 块里，写 max_body_mb 就会静默关掉并发闸。
+	if c.SessionHeartbeat == nil {
+		on := true
+		c.SessionHeartbeat = &on
 	}
 	if c.CatalogCacheFile == "" {
 		dir := filepath.Dir(c.StateFile)

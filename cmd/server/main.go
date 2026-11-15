@@ -109,7 +109,8 @@ func main() {
 		}(),
 		QueueMaxAttempts: cfg.QueueMaxAttempts,
 		MaxBodyBytes:     int64(cfg.MaxBodyMB) << 20,
-		SessionHeartbeat: cfg.SessionHeartbeat,
+		// normalize 已把 nil 归一成 true，这里只需解引用。
+		SessionHeartbeat: cfg.SessionHeartbeat != nil && *cfg.SessionHeartbeat,
 		ConvStateFile:    cfg.StateFile + ".chats.json",
 		WatchInfo: map[string]any{
 			"enabled":              cfg.Watch.Enabled,
