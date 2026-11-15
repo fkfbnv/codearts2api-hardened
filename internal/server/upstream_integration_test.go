@@ -5,10 +5,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"codearts2api/internal/auth"
+	"codearts2api/internal/pool"
 	"codearts2api/internal/upstream"
 )
 
@@ -47,7 +50,12 @@ func TestFirstFrameModelErrorReturnsHTTP404(t *testing.T) {
 	}
 }
 
-// 上游 401：只能软冷却，绝不能把账号永久禁用（1110 自锁事故的回归测试）。
+// 上游 401：绝不能把账号永久禁用（1110 自锁事故的回归测试）。
+//
+// 这里的测试账号没有 refresh_token，所以「刷新后重试」这条路走不通，只能落到
+// 错误计数：ErrThreshold=1 时计一次错误即软冷却。关键不变量是 disabled=0——
+// 1110 那次就是一次 401 直接 Disable，watchdog 跳过禁用账号 → 凭据再也不刷新。
+// 有 refresh_token 的情形见 TestAuth0301RefreshesAndRetriesWithoutCooldown。
 func TestUpstream401SoftCooldownsInsteadOfDisabling(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
@@ -63,20 +71,104 @@ func TestUpstream401SoftCooldownsInsteadOfDisabling(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
 
-	total, healthy, disabled, cooling, _ := p.Stats()
+	total, _, disabled, _, _ := p.Stats()
 	if total == 0 {
 		t.Fatal("test pool has no accounts")
 	}
 	if disabled != 0 {
 		t.Fatalf("401 must not permanently disable accounts: %#v", p.List())
 	}
-	if healthy != 0 || cooling != total {
-		t.Fatalf("401 should soft-cool all accounts: total=%d healthy=%d cooling=%d", total, healthy, cooling)
-	}
 	for _, st := range p.List() {
 		if st["disabled"] == true {
 			t.Fatalf("account left disabled after 401: %#v", st)
 		}
+	}
+}
+
+// P1 回归：上游回 APIG.0301（decrypt token fail）时，必须「立即强制刷新 token
+// 再重试一次」，而不是把账号扔进 60s 软冷却。
+//
+// 2026-11-15 实测：12:54/12:56/12:58/13:00 四次 pool cooldown 全是这个形态，
+// 集中在 token 到期前的刷新窗口。旧代码只对 HTTP 401 刷新，而 0301 可能被包成
+// 其它形态；且刷新成功后立刻重试仍会被拒（APIG 侧新 token 生效有延迟）。
+func TestAuth0301RefreshesAndRetriesWithoutCooldown(t *testing.T) {
+	var chatHits int
+	var sawRefreshedToken bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
+		chatHits++
+		// 第一次用旧 token → 0301；刷新之后（新 token）→ 正常出字。
+		if tok := r.Header.Get("x-auth-token"); tok != "NEW-TOKEN" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error_msg":"Incorrect IAM authentication information: decrypt token fail","error_code":"APIG.0301"}`)
+			return
+		}
+		sawRefreshedToken = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer backend.Close()
+
+	sts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"refresh_token": "REFRESH-2",
+			"credentials": {
+				"access_key_id": "AK-NEW",
+				"secret_access_key": "SK-NEW",
+				"security_token": "NEW-TOKEN",
+				"expiration": "`+time.Now().Add(2*time.Hour).UTC().Format(time.RFC3339)+`"
+			}
+		}`)
+	}))
+	defer sts.Close()
+
+	dpopJWK, err := upstream.NewDPoPPrivateJWK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginCfg := upstream.DefaultLoginConfig()
+	loginCfg.STSHost = sts.URL
+
+	acct := auth.New(t.Name()+"-acct", "tester", "domain", "OLD-TOKEN", "AK-OLD", "SK-OLD",
+		// 剩余 3h、skew=30m：Validate 不会提前刷新，刷新只能由 0301 触发，
+		// 这样测的才是「请求路径上的 refresh→retry」，而不是后台主动续期。
+		time.Now().Add(3*time.Hour).Format(time.RFC3339), "REFRESH-1", "verifier",
+		map[string]string(dpopJWK))
+	if err := acct.SetPathAndSave(filepath.Join(t.TempDir(), acct.FileName())); err != nil {
+		t.Fatal(err)
+	}
+	p, err := pool.New([]*auth.Auth{acct}, pool.Config{MaxConcurrent: 1, ErrThreshold: 1, LoginConfig: loginCfg}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range p.Accounts() {
+		a.Client = upstream.NewWithChatEndpoint(2*time.Second, backend.URL)
+	}
+	h := NewHandler(Config{Pool: p, DefaultModel: "glm-5.2", MaxRotate: 2, ErrThreshold: 1})
+
+	body := `{"model":"GLM-5.2","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("0301 should be recovered by refresh+retry, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !sawRefreshedToken {
+		t.Fatal("retry did not carry the refreshed token")
+	}
+	if chatHits < 2 {
+		t.Fatalf("expected a retry after refresh, chat hits=%d", chatHits)
+	}
+	total, healthy, disabled, cooling, _ := p.Stats()
+	if disabled != 0 {
+		t.Fatalf("0301 must not disable accounts: %#v", p.List())
+	}
+	if cooling != 0 || healthy != total {
+		t.Fatalf("0301 recovered by refresh must not leave cooldown: total=%d healthy=%d cooling=%d",
+			total, healthy, cooling)
 	}
 }
 

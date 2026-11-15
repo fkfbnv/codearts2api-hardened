@@ -110,6 +110,9 @@ type Client struct {
 	snapBase        string
 	snapManagerBase string
 	benefitBase     string
+	// heartbeatBase 并发会话心跳基址（见 session.go heartbeatURL）。
+	// 单独留字段：测试注入 httptest 地址时不必连带改写其它端点。
+	heartbeatBase string
 	// chatURL chat-completions 完整地址覆盖（测试注入用，留空走 snapBase）。
 	chatURL string
 
@@ -143,6 +146,7 @@ func New(timeout time.Duration) *Client {
 		snapBase:        SnapEngineApiHost,
 		snapManagerBase: SnapManagerHost,
 		benefitBase:     BenefitHost,
+		heartbeatBase:   SnapEngineApiHost,
 		srcFail:         map[string]time.Time{},
 	}
 	return c

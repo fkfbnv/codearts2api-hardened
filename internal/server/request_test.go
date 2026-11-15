@@ -239,6 +239,47 @@ func TestConversationIDSeparatesTitleChatFromToolAgent(t *testing.T) {
 	}
 }
 
+// 同一句话发给不同模型不能共用一个 chat_id。
+// 2026-11-15 实测：五个模型（DS-Flash / GLM-5.3-Flash / DS-1017 / Kimi-K3 /
+// GLM-5.2）返回的 chat_id 全是同一个 7478dcf9…——chat_id 只由首条 user 消息
+// 决定、与模型无关，导致多模型并发共享上游会话与 prompt cache。
+func TestConversationIDSeparatesModels(t *testing.T) {
+	msgs := []openAIMessage{{Role: "user", Text: "say ok"}}
+	seen := map[string]string{}
+	for _, model := range []string{"deepseek-v4.1-flash", "glm-5.3-flash", "kimi-k3", "glm-5.2"} {
+		id := conversationIDFor(&chatRequest{Messages: msgs, Model: model}, "")
+		if !validChatID(id) {
+			t.Fatalf("%s: invalid chat id %q", model, id)
+		}
+		if prev, dup := seen[id]; dup {
+			t.Fatalf("%s and %s share chat_id %s", prev, model, id)
+		}
+		seen[id] = model
+	}
+}
+
+// 模型名大小写不同（OpenAI 习惯小写）必须归一到同一个 chat_id，
+// 否则同一模型的两次调用会因为写法不同而开两个上游会话。
+func TestConversationIDModelCaseInsensitive(t *testing.T) {
+	msgs := []openAIMessage{{Role: "user", Text: "say ok"}}
+	lower := conversationIDFor(&chatRequest{Messages: msgs, Model: "glm-5.2"}, "")
+	upper := conversationIDFor(&chatRequest{Messages: msgs, Model: "GLM-5.2"}, "")
+	if lower != upper {
+		t.Fatalf("model case must not fork chat_id: %q vs %q", lower, upper)
+	}
+}
+
+// 显式 conversation_id 仍然优先：续聊不该因为换模型就断开头。
+func TestExplicitConversationIDWinsOverModel(t *testing.T) {
+	const conv = "0123456789abcdef0123456789abcdef"
+	msgs := []openAIMessage{{Role: "user", Text: "say ok"}}
+	a := conversationIDFor(&chatRequest{Messages: msgs, Model: "glm-5.2", ConversationID: conv}, "")
+	b := conversationIDFor(&chatRequest{Messages: msgs, Model: "kimi-k3", ConversationID: conv}, "")
+	if a != conv || b != conv {
+		t.Fatalf("explicit conversation_id must win: %q %q", a, b)
+	}
+}
+
 func TestFlattenContent(t *testing.T) {
 	if flattenContent(json.RawMessage(`"plain"`)) != "plain" {
 		t.Fatal("string content")

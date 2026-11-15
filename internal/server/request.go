@@ -422,6 +422,13 @@ func conversationIDFor(req *chatRequest, headerValue string) string {
 				// 两者必须分开，否则标题生成会污染内置 Agent 会话。
 				anchor += "\x00tools"
 			}
+			// 模型也进锚点：同一句「say ok」发给 5 个模型，如果 chat_id 只由首条
+			// user 消息决定，5 个模型会共用同一个上游会话（实测五个模型返回的
+			// chat_id 全是同一个 7478dcf9…），多模型并发会互相污染 prompt cache
+			// 与上下文。显式 conversation_id 仍然优先（那是续聊语义，不该被拆）。
+			if m := strings.TrimSpace(req.Model); m != "" && m != "auto" {
+				anchor += "\x00model=" + strings.ToLower(m)
+			}
 			sum := sha256.Sum256([]byte(anchor))
 			return hex.EncodeToString(sum[:16])
 		}

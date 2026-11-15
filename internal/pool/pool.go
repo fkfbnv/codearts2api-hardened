@@ -49,6 +49,10 @@ type Account struct {
 	activeConcurrent  int       // 当前活跃并发请求数
 	maxConcurrent     int       // 最大允许并发数
 	keepaliveLastPing time.Time // 最后保活心跳时间
+	// refreshedAt 最后一次成功刷新凭据的时间。并发 401 各自触发刷新时，后来者
+	// 用「时间戳没变」判定前一个已经刷过，直接复用其结果而不是再刷一次——
+	// refresh_token 是用过即换的一次性凭据，连刷两次会让先到手的 token 立刻作废。
+	refreshedAt time.Time
 }
 
 // Config 池配置。
@@ -619,8 +623,24 @@ func (p *Pool) CheckAndRefreshToken(name string) error {
 	return p.CheckAndRefreshTokenWithin(name, time.Hour)
 }
 
-// RefreshToken 手动刷新指定账号的 token。
+// RefreshToken 刷新指定账号的 STS 凭据。
+//
+// refresh_token 是一次性的（用过即换），而且上游侧旧 token 会立刻失效。所以并发
+// 的 401 如果各自刷新，后一次刷新会让前一个请求刚拿到的 token 立即作废，表现为
+// 「刷新成功了但紧接着仍被 APIG.0301 拒」。这里用 RefreshTokenIfStale 做单飞：
+// refreshMu 串行化，且拿到锁后先看凭据是否已被别人刷新过（refreshedAt 变化），
+// 是就直接返回，不再消耗 refresh_token。
 func (p *Pool) RefreshToken(name string) error {
+	_, err := p.RefreshTokenIfStale(name, 0)
+	return err
+}
+
+// RefreshTokenIfStale 在「最近 maxAge 内没有成功刷新过」时刷新凭据。
+// 返回 refreshed 表示本次是否真的打了上游换票。
+//
+// maxAge > 0 让调用方（请求路径上的 401 重试）避免连刷：只要几十毫秒内别人已经
+// 刷成功，直接用其新凭据重试即可。
+func (p *Pool) RefreshTokenIfStale(name string, maxAge time.Duration) (refreshed bool, err error) {
 	p.mu.Lock()
 	var acct *Account
 	for _, a := range p.accounts {
@@ -631,24 +651,34 @@ func (p *Pool) RefreshToken(name string) error {
 	}
 	p.mu.Unlock()
 	if acct == nil {
-		return fmt.Errorf("account not found: %s", name)
+		return false, fmt.Errorf("account not found: %s", name)
 	}
 	acct.refreshMu.Lock()
 	defer acct.refreshMu.Unlock()
 
+	// 双检：拿锁期间别人可能已经刷完了（并发 401 的常见形态）。
+	if maxAge > 0 {
+		acct.mu.Lock()
+		fresh := !acct.refreshedAt.IsZero() && time.Since(acct.refreshedAt) < maxAge
+		acct.mu.Unlock()
+		if fresh {
+			return false, nil
+		}
+	}
+
 	authz := acct.Auth
 	refreshToken := authz.Refresh()
 	if refreshToken == "" {
-		return fmt.Errorf("no refresh_token available")
+		return false, fmt.Errorf("no refresh_token available")
 	}
 	dpopPrivateJWK := authz.DPoPPrivateJWK()
 	if dpopPrivateJWK["d"] == "" {
-		return fmt.Errorf("no DPoP private key available; re-login required")
+		return false, fmt.Errorf("no DPoP private key available; re-login required")
 	}
 
 	resp, err := acct.Client.RefreshToken(context.Background(), p.cfg.LoginConfig, refreshToken, authz.Verifier(), upstream.DPoPPrivateJWK(dpopPrivateJWK))
 	if err != nil {
-		return fmt.Errorf("refresh failed: %w", err)
+		return false, fmt.Errorf("refresh failed: %w", err)
 	}
 
 	if err := authz.UpdateCredentials(
@@ -658,16 +688,18 @@ func (p *Pool) RefreshToken(name string) error {
 		resp.Credentials.Expiration,
 		resp.RefreshToken,
 	); err != nil {
-		return fmt.Errorf("save token: %w", err)
+		return false, fmt.Errorf("save token: %w", err)
 	}
 	acct.mu.Lock()
 	acct.disabled = false
 	acct.disabledReason = ""
 	acct.lastErr = ""
 	acct.lastValidated = time.Now()
+	acct.refreshedAt = time.Now()
+	acct.coolUntil = time.Time{} // 新凭据能覆盖旧的 0301 冷却结论
 	acct.mu.Unlock()
-	log.Printf("pool token refreshed manually account=%s", name)
-	return nil
+	log.Printf("pool token refreshed account=%s remaining=%s", name, authz.Remaining().Round(time.Minute))
+	return true, nil
 }
 
 // RefreshAllTokens 批量刷新所有临期 token（用于 cron 或脚本）。
@@ -932,6 +964,22 @@ func (p *Pool) loadState() {
 				a.lastErr = s.LastErr
 				a.mu.Unlock()
 			}
+		}
+	}
+	// 丢掉对不上任何账号的孤儿条目并落盘。
+	//
+	// 身份为空时账号名是空串，state.json 里留下 {"name":""}。身份修好后这些
+	// 条目永远匹配不上，却会一直躺在文件里——验收时看到 name="" 会误判成
+	// 「账号身份还是空的」，也掩盖真正需要关注的 err_count/disabled。
+	matched := make(map[string]bool, len(p.accounts))
+	for _, a := range p.accounts {
+		matched[a.Name] = true
+	}
+	for _, s := range data {
+		if !matched[s.Name] {
+			log.Printf("pool state: dropping orphan entry name=%q (account no longer present)", s.Name)
+			p.saveState()
+			return
 		}
 	}
 }

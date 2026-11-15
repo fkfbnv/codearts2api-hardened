@@ -22,7 +22,13 @@ import (
 )
 
 const (
-	// EpChatSessionHeartbeat 并发会话心跳端点（相对 snap-manager）。
+	// EpChatSessionHeartbeat 并发会话心跳端点（相对 snap-access 主机的完整路径）。
+	//
+	// 不要把它拼到 SnapManagerHost（= SnapEngineApiHost + "/snap-manager"）后面：
+	// 那会得到 /snap-manager/snap-manager/v1/... 并被 APIG 判 404 APIG.0101。
+	// 1112 得出的「上游心跳接口未发布」正是这个拼接错误造成的假象——2026-11-15
+	// 实测正确路径回 200 {"status":"ok"}，官方 CLI 也用的是同一个路径
+	// （installers/bin/codearts.exe 里 `"/snap-manager/v1/chat-session/heartbeat"`）。
 	EpChatSessionHeartbeat = "/snap-manager/v1/chat-session/heartbeat"
 	// heartbeatInterval busy 续期间隔；上游槽位默认租期约 60s，30s 续一次足够。
 	heartbeatInterval = 30 * time.Second
@@ -108,10 +114,23 @@ func (s *ChatSession) keepalive() {
 	}
 }
 
+// heartbeatURL 拼接心跳端点完整地址。
+//
+// 基址取 heartbeatBase（默认 SnapEngineApiHost），而不是 snapManagerBase：
+// 后者的值是 SnapEngineApiHost + "/snap-manager"，而 EpChatSessionHeartbeat
+// 本身就以 "/snap-manager" 开头，拼一起就是双前缀 404。
+func (c *Client) heartbeatURL(status string) string {
+	base := c.heartbeatBase
+	if base == "" {
+		base = SnapEngineApiHost
+	}
+	return base + EpChatSessionHeartbeat + "?status=" + status
+}
+
 // beat 发一次心跳：PUT 端点 + {} 体，头族照官方客户端（x-client-type: kernel）。
 // 签名带 Host——signRequest 恒定包含 Host，与该内部端点的官方签名一致。
 func (s *ChatSession) beat(ctx context.Context, status string) error {
-	endpoint := s.client.snapManagerBase + EpChatSessionHeartbeat + "?status=" + status
+	endpoint := s.client.heartbeatURL(status)
 	body := []byte("{}")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
 	if err != nil {

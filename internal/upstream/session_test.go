@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,7 +39,7 @@ func TestChatSessionHeartbeatLifecycle(t *testing.T) {
 	defer srv.Close()
 
 	c := New(5 * time.Second)
-	c.snapManagerBase = srv.URL
+	c.heartbeatBase = srv.URL
 	cred := SignCredential{AccessKeyID: "AK", SecretAccessKey: "SK", SecurityToken: "ST"}
 
 	s, err := c.BeginChatSession(context.Background(), cred)
@@ -89,7 +90,7 @@ func TestChatSessionBusyRejectedSendsIdle(t *testing.T) {
 	defer srv.Close()
 
 	c := New(5 * time.Second)
-	c.snapManagerBase = srv.URL
+	c.heartbeatBase = srv.URL
 	if _, err := c.BeginChatSession(context.Background(), SignCredential{AccessKeyID: "AK", SecretAccessKey: "SK"}); err == nil {
 		t.Fatal("busy rejected should return error")
 	}
@@ -97,5 +98,24 @@ func TestChatSessionBusyRejectedSendsIdle(t *testing.T) {
 	defer mu.Unlock()
 	if len(beats) != 2 || beats[0] != "busy" || beats[1] != "idle" {
 		t.Fatalf("busy 失败后应补发 idle，got %v", beats)
+	}
+}
+
+// 心跳地址必须只有一层 /snap-manager。1112 那次「上游未发布心跳（APIG.0101）」
+// 的结论是自己把 EpChatSessionHeartbeat 拼到 SnapManagerHost 上造成的双前缀 404：
+// 2026-11-15 实测正确路径回 200 {"status":"ok"}。这条测试锁死拼接方式。
+func TestHeartbeatURLHasSingleSnapManagerPrefix(t *testing.T) {
+	c := New(5 * time.Second)
+
+	got := c.heartbeatURL("busy")
+	want := SnapEngineApiHost + "/snap-manager/v1/chat-session/heartbeat?status=busy"
+	if got != want {
+		t.Fatalf("heartbeat URL wrong:\n got %s\nwant %s", got, want)
+	}
+	if strings.Contains(got, "/snap-manager/snap-manager") {
+		t.Fatalf("heartbeat URL has duplicated /snap-manager prefix: %s", got)
+	}
+	if strings.Count(got, "/snap-manager") != 1 {
+		t.Fatalf("expected exactly one /snap-manager segment, got %s", got)
 	}
 }

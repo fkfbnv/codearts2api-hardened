@@ -5,7 +5,6 @@ import (
 	"context"
 	crand "crypto/rand"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -106,6 +105,21 @@ var staticModels = []staticModel{
 const (
 	dynamicModelsTTL        = time.Hour
 	modelsFetchFailCooldown = 5 * time.Minute
+
+	// authRetryBudget 凭据被拒后的「刷新 → 等待 → 重试」次数上限。
+	//
+	// 0301 decrypt token fail 集中在 token 到期前的刷新窗口：实测刷新成功后立刻
+	// 重试仍可能再被拒一次（APIG 侧新 token 生效有延迟），隔约 1s 就通。给 3 次
+	// 足够覆盖这个窗口，又不至于对着真正失效的凭据空转。
+	authRetryBudget = 3
+
+	// authRetryBackoff 每次刷新后重试前的等待。上游新 AK/SK+security_token 在
+	// APIG 侧不是瞬时生效的，立即重试会继续吃 0301。
+	authRetryBackoff = 1200 * time.Millisecond
+
+	// authRefreshFreshWindow 判定「别人刚刷过、不必再刷」的时间窗。
+	// refresh_token 用过即换，并发请求各自刷新会让先到手的 token 立刻作废。
+	authRefreshFreshWindow = 30 * time.Second
 )
 
 // DefaultMaxBodyBytes 请求体默认上限（1107 实测 8MB 会 413，32MB 够长会话+图）。
@@ -340,20 +354,26 @@ func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier stri
 
 	// portal 回调只回传 code，不带身份；user_id 为空会让 auth.FileName() 退化成
 	// codearts-unknown.json，账号池按 UserID 建索引就会加载不到（或与既有账号重复）。
-	// 因此落盘前用 STS 凭证把身份补全，补全失败也要保证 user_id 有值。
-	if a.UserID == "" || a.UserName == "" {
+	// 因此落盘前把身份补全：先问 STS（caller-identity / current/user），打不通就
+	// 从 refresh_token 的 user_profile 解——后者是本地可算的，永远有兜底。
+	if a.UserID == "" || a.UserName == "" || a.DomainID == "" {
 		uid, uname, domain := lookupIdentity(a)
-		if uid == "" {
-			// 兜底：refresh_token 里的 sub 是唯一且稳定的，避免写出 unknown 文件
-			uid = identityFromRefreshToken(tok.RefreshToken)
-			log.Printf("webui login: identity lookup failed, fallback user_id=%q", uid)
-		}
-		if uid != "" {
-			a.UserID, a.UserName = uid, firstNonEmpty(uname, a.UserName)
-			if domain != "" {
-				a.DomainID = domain
+		if uid == "" || uname == "" || domain == "" {
+			// 兜底：身份就在 refresh_token 的 user_profile 里（JWT 的 payload）。
+			// 注意 JWT 没有 sub claim，旧 fallback 解 sub 永远得到空串。
+			id := auth.IdentityFromRefreshToken(tok.RefreshToken)
+			if !id.Empty() {
+				uid = firstNonEmpty(uid, id.UserID)
+				uname = firstNonEmpty(uname, id.UserName)
+				domain = firstNonEmpty(domain, id.DomainID)
+				log.Printf("webui login: identity from refresh_token user_id=%q name=%q", uid, uname)
+			} else {
+				log.Printf("webui login: identity lookup failed and refresh_token carries none")
 			}
 		}
+		a.UserID = firstNonEmpty(a.UserID, uid)
+		a.UserName = firstNonEmpty(a.UserName, uname)
+		a.DomainID = firstNonEmpty(a.DomainID, domain)
 	}
 	if err := auth.SaveNew(h.cfg.AuthDir, a); err != nil {
 		return err
@@ -389,24 +409,9 @@ func lookupIdentity(a *auth.Auth) (uid, name, domain string) {
 	return "", "", ""
 }
 
-// identityFromRefreshToken 从 JWT 形式的 refresh_token 里取 sub 作为兜底 user_id。
-func identityFromRefreshToken(tok string) string {
-	parts := strings.Split(tok, ".")
-	if len(parts) < 2 {
-		return ""
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return ""
-	}
-	var claims struct {
-		Sub string `json:"sub"`
-	}
-	if json.Unmarshal(raw, &claims) != nil {
-		return ""
-	}
-	return claims.Sub
-}
+// identityFromRefreshToken 已删除：refresh_token 的 JWT 里没有 sub claim，
+// 取 sub 只会返回空串（本机 codearts-unknown.json 就是这条路的产物）。
+// 身份改从 payload 的 user_profile 解，见 auth.IdentityFromRefreshToken。
 
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
@@ -497,8 +502,6 @@ func (h *Handler) probeUnknownAsync() {
 	}()
 }
 
-// hasFreshCandidate 报告是否还有没试过、健康、且未被判定「该模型不可用」的
-// 账号（上游 #11：模型级错误先换号，全部候选判死才 404）。
 // isHeartbeatUnavailable 报告心跳端点在上游环境不存在（APIG.0101 路由未发布）。
 // 此时并发闸没启用，应降级为无心跳直连而不是换号。
 func isHeartbeatUnavailable(err error) bool {
@@ -506,6 +509,48 @@ func isHeartbeatUnavailable(err error) bool {
 	return strings.Contains(low, "apig.0101") || strings.Contains(low, "does not exist or has not been published")
 }
 
+// heartbeatUnavailableLogGate 压掉「心跳不可用」告警的重复输出。
+//
+// 这条降级原来每个请求打一条（1112 实测几秒一条，一天几百行），把真正有用的
+// 上游错误全淹了。降级本身是安全的（无心跳直连仍然出字），所以按账号限流：
+// 每个账号每 24h 最多一条，并带累计次数，便于判断是偶发还是持续。
+var heartbeatUnavailableLogGate = struct {
+	sync.Mutex
+	last    map[string]time.Time
+	suppres map[string]int
+}{last: map[string]time.Time{}, suppres: map[string]int{}}
+
+// noteHeartbeatUnavailable 记录一次降级，必要时打一条日志。
+func noteHeartbeatUnavailable(account string, err error) {
+	const window = 24 * time.Hour
+
+	heartbeatUnavailableLogGate.Lock()
+	if heartbeatUnavailableLogGate.last == nil {
+		heartbeatUnavailableLogGate.last = map[string]time.Time{}
+		heartbeatUnavailableLogGate.suppres = map[string]int{}
+	}
+	now := time.Now()
+	last, seen := heartbeatUnavailableLogGate.last[account]
+	if seen && now.Sub(last) < window {
+		heartbeatUnavailableLogGate.suppres[account]++
+		heartbeatUnavailableLogGate.Unlock()
+		return
+	}
+	skipped := heartbeatUnavailableLogGate.suppres[account]
+	heartbeatUnavailableLogGate.suppres[account] = 0
+	heartbeatUnavailableLogGate.last[account] = now
+	heartbeatUnavailableLogGate.Unlock()
+
+	if skipped > 0 {
+		log.Printf("chat-session heartbeat unavailable (proceeding without) account=%s: %v (suppressed %d similar in last %s)",
+			account, err, skipped, window)
+		return
+	}
+	log.Printf("chat-session heartbeat unavailable (proceeding without) account=%s: %v", account, err)
+}
+
+// hasFreshCandidate 报告是否还有没试过、健康、且未被判定「该模型不可用」的
+// 账号（上游 #11：模型级错误先换号，全部候选判死才 404）。
 func (h *Handler) hasFreshCandidate(model string, tried map[string]bool) bool {
 	for _, acct := range h.cfg.Pool.Accounts() {
 		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
@@ -921,9 +966,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			s, sessErr := acct.Client.BeginChatSession(r.Context(), cred)
 			if sessErr != nil {
 				if isHeartbeatUnavailable(sessErr) {
-					// 心跳接口在上游环境不存在（APIG.0101，2026-11-12 实测）：
-					// 这套并发闸没启用，静默降级为无心跳直连。
-					log.Printf("chat-session heartbeat unavailable (proceeding without) account=%s: %v", acct.Name, sessErr)
+					// 心跳接口在该上游环境回 APIG.0101（路由未发布）：这套并发闸
+					// 没启用，静默降级为无心跳直连。日志按账号限流，见
+					// noteHeartbeatUnavailable——原来每个请求一条，一天几百行。
+					noteHeartbeatUnavailable(acct.Name, sessErr)
 				} else {
 					h.cfg.Pool.ReleaseLock(acct.Name)
 					log.Printf("chat-session busy rejected account=%s model=%s: %v", acct.Name, model, sessErr)
@@ -950,6 +996,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var rc io.ReadCloser
 		var serr error
 		authRetried := false
+		authAttempts := 0
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
 		benefit := upstream.IsBenefitModel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
@@ -958,22 +1005,46 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if serr == nil {
 				break
 			}
-			var ae *upstream.ApiError
-			if errors.As(serr, &ae) && (ae.Status == 401 || ae.Code == 401) && !authRetried && acct.Auth.Refresh() != "" {
-				if rerr := h.cfg.Pool.RefreshToken(acct.Name); rerr == nil {
+			// 凭据/签名被拒（401、APIG.0301 decrypt token fail、APIG.0602）：
+			// 立即强制刷新 token 再重试，而不是把账号扔进冷却。
+			//
+			// 判据从「HTTP 401」放宽到完整的 auth 分类：上游可能把 0301 包成
+			// 其它状态码（200 内嵌 / 502），只认状态码会漏掉这些形态。刷新走
+			// RefreshTokenIfStale 单飞——refresh_token 用过即换，并发请求各自
+			// 刷新会让先到手的 token 立刻作废，那正是"刷新成功却仍被拒"的来源。
+			if !authRetried && acct.Auth.Refresh() != "" && isAuthError(serr) {
+				refreshed, rerr := h.cfg.Pool.RefreshTokenIfStale(acct.Name, authRefreshFreshWindow)
+				if rerr == nil {
 					token, accessKeyID, secretAccessKey = acct.Auth.Credentials()
 					cred = upstream.SignCredential{
 						AccessKeyID:     accessKeyID,
 						SecretAccessKey: secretAccessKey,
 						SecurityToken:   token,
 					}
-					authRetried = true
-					log.Printf("upstream 401 account=%s: token refreshed, retrying request once", acct.Name)
+					authAttempts++
+					if authAttempts >= authRetryBudget {
+						authRetried = true
+					}
+					// 等一个极短窗口再重试：新 token 在 APIG 侧生效不是瞬时的
+					// （实测刷新后立刻重试仍可能 0301，隔 ~1s 即通）。
+					select {
+					case <-time.After(authRetryBackoff):
+					case <-r.Context().Done():
+						writeOpenAIError(w, http.StatusServiceUnavailable, "client_cancelled", "client disconnected")
+						return
+					}
+					if refreshed {
+						log.Printf("upstream auth error account=%s: token refreshed (attempt %d/%d), retrying",
+							acct.Name, authAttempts, authRetryBudget)
+					} else {
+						log.Printf("upstream auth error account=%s: credentials already refreshed by a concurrent request, retrying (attempt %d/%d)",
+							acct.Name, authAttempts, authRetryBudget)
+					}
 					continue
-				} else {
-					log.Printf("upstream 401 account=%s: refresh before retry failed: %v", acct.Name, rerr)
 				}
+				log.Printf("upstream auth error account=%s: refresh before retry failed: %v", acct.Name, rerr)
 			}
+			var ae *upstream.ApiError
 			if errors.As(serr, &ae) && isQueueLimitError(ae) {
 				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
 				// 释放锁让其他请求有机会，等待后重新获取
@@ -1389,10 +1460,14 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 	case errKindAuth:
 		// 1110 事故：这里以前是 Disable，一次 401 就把账号永久禁用，watchdog
 		// 跳过 disabled 账号 → 凭据不再刷新 → 整池 503 直到手工改 state.json。
-		// 改为软冷却 + 记录：请求路径已先尝试刷新 token（handler 主循环），
-		// 走到这里说明刷新失败或是瞬时签名问题，短冷却足以自愈。
+		//
+		// 请求路径在走到这里之前已经做过「立即刷新 token 再重试」（见
+		// chatCompletions 的 auth 重试段）。还能走到这里说明刷新后重试仍被拒，
+		// 或者根本没有 refresh_token。此时用**软**冷却而不是累计错误：
+		// NoteError 在 err_threshold=3 时给 10m 冷却，比原来的 60s 更狠，
+		// 而 0301 往往是刷新窗口的瞬态——60s 后自愈才是想要的行为。
 		h.cfg.Pool.Cooldown(acct.Name, pool.CoolSoft, h.cfg.SoftCooldown, reason)
-		log.Printf("upstream auth error (soft cooldown, not disabled) account=%s: %s msg=%s",
+		log.Printf("upstream auth error (refresh+retry exhausted, soft cooldown) account=%s: %s msg=%s",
 			acct.Name, reason, truncateMsg(upstreamErrorText(err), 160))
 		return false
 
@@ -1438,6 +1513,17 @@ func isContentModerationError(err error) bool {
 func isParamInvalidError(err error) bool {
 	kind, _ := classifyUpstreamError(err)
 	return kind == errKindParamInvalid
+}
+
+// isAuthError 判断是否为「凭据/签名被上游拒绝」类错误，即值得刷新 token 后重试的情形
+// （401、APIG.0301 decrypt token fail、APIG.0602、verify ak sk signature fail）。
+//
+// 以前判据只看 HTTP 401：上游把 0301 塞进 200 的 SSE 正文或包成 502 时，请求路径
+// 就不会触发刷新，直接落到 handleUpstreamError 里给账号上一个 60s 软冷却——
+// 2026-11-15 实测 12:54/12:56/12:58/13:00 四次冷却全是这种形态。
+func isAuthError(err error) bool {
+	kind, _ := classifyUpstreamError(err)
+	return kind == errKindAuth
 }
 
 // isConcurrentLimitError 判断是否为上游并发会话上限错误（瞬时、可重试）。
@@ -1515,7 +1601,37 @@ func (h *Handler) loadChats() {
 	if err != nil {
 		return
 	}
-	_ = json.Unmarshal(raw, &h.chats)
+	if json.Unmarshal(raw, &h.chats) != nil {
+		return
+	}
+	h.migrateAnonChats()
+}
+
+// migrateAnonChats 把历史遗留的空键 chat_id 迁到真实账号名下。
+//
+// 身份为空时 acct.Name 是空串，h.chats[""] = <chat_id>；身份修好后键变成
+// user_id，那个空键就成孤儿（既不会被读也不会被清）。单账号部署下空键必然属于
+// 当前唯一账号，直接迁移；多账号时也能确定归属（空键只可能来自身份缺失期）。
+func (h *Handler) migrateAnonChats() {
+	orphan, ok := h.chats[""]
+	if !ok {
+		return
+	}
+	delete(h.chats, "")
+	var target string
+	if accts := h.cfg.Pool.Accounts(); len(accts) == 1 {
+		target = accts[0].Name
+	}
+	if target == "" {
+		log.Printf("chats: dropped orphan chat_id=%s (account identity still unknown)", orphan)
+		h.saveChats()
+		return
+	}
+	if _, exists := h.chats[target]; !exists {
+		h.chats[target] = orphan
+	}
+	h.saveChats()
+	log.Printf("chats: migrated orphan chat_id=%s to account=%s", orphan, target)
 }
 
 func (h *Handler) saveChats() {

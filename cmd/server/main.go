@@ -32,6 +32,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
 	}
+	// 用 refresh_token 里的 user_profile 回填缺失身份，并把 codearts-unknown.json
+	// 改名成 codearts-<user_id>.json。历史文件是空身份（portal 回调不带身份），
+	// 不回填的话日志里 account= 全空、账号池索引退化成空键、chats 键变成 ""，
+	// 所有模型共用一个 chat_id。必须在 pool.New 之前做——池按 UserID 建索引。
+	auths = auth.BackfillIdentities(auths, cfg.AuthDir)
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 	if len(auths) == 0 {
 		log.Printf("WARNING: no accounts found. Run `codearts2api login` first.")
