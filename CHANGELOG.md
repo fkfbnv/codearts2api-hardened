@@ -2,7 +2,7 @@
 
 本文件记录本维护分支相对上游 [HITZY2002/codearts2api](https://github.com/HITZY2002/codearts2api) 的改动。
 
-## 未发布
+## v1.0.1 — 2026-11-17
 
 ### 直连路径
 
