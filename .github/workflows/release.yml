@@ -1,0 +1,34 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.24.x'
+          cache: false
+      - name: Build Windows binaries
+        run: make windows
+      - name: Checksums
+        run: |
+          cd bin
+          md5sum *.exe > md5sums.txt
+          cat md5sums.txt
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bin/codearts2api.exe
+            bin/codearts2api-login.exe
+            bin/codearts2api-credit.exe
+            bin/codearts2api-apply.exe
+            bin/md5sums.txt

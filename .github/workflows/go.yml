@@ -2,7 +2,7 @@ name: Go CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/2026-11-hardening]
   pull_request:
   workflow_dispatch:
 
