@@ -504,6 +504,11 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		usage     map[string]any
 	)
 	var pendingEvent string
+	// pendingRole 缓存只带 role 的首帧。上游常在拒绝前先发角色帧；把它立刻写出
+	// 去就等于响应已经开始，后面的业务错误只能降级成 200 + SSE error。角色帧
+	// 本身没有任何正文语义，所以延迟到第一段正文/reasoning/tool_call（或收尾）
+	// 时一起发，尚未发任何字节前仍可返回 PreStreamError 让 handler 回真状态码。
+	var pendingRole string
 
 	completion := func() *RawCompletion {
 		return &RawCompletion{Content: unwrapQAContent(content.String()), Reasoning: reason.String(), Finish: finish, ToolCalls: sortedToolCalls(calls), Usage: usage}
@@ -553,6 +558,14 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		}
 		return nil
 	}
+	flushRole := func() error {
+		if pendingRole == "" {
+			return nil
+		}
+		role := pendingRole
+		pendingRole = ""
+		return writeChunk(map[string]any{"role": role}, "")
+	}
 	writeErr := func(msg string) error {
 		payload := map[string]any{"error": map[string]any{"message": msg, "type": "upstream_error", "code": "CODEARTS_STREAM_ERROR"}}
 		raw, _ := json.Marshal(payload)
@@ -575,6 +588,10 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		if ev, data, ok := scanLine(strings.TrimRight(line, "\r\n"), &pendingEvent); ok {
 			if strings.TrimSpace(data) == "[DONE]" {
 				if !sawDone {
+					if werr := flushRole(); werr != nil {
+						streamErr = werr
+						break
+					}
 					if werr := writeDONE(true); werr != nil {
 						streamErr = werr
 						break
@@ -613,7 +630,7 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			}
 			delta := map[string]any{}
 			if role, ok := nativeDelta["role"].(string); ok && role != "" {
-				delta["role"] = role
+				pendingRole = role
 			}
 			if content.Len() > beforeContent {
 				delta["content"] = content.String()[beforeContent:]
@@ -625,12 +642,21 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 				delta["tool_calls"] = toolCalls
 			}
 			if len(delta) > 0 || nativeFinish != "" {
+				// 角色帧随第一段真实输出一起发；只有角色帧时继续留着，等收尾或错误。
+				if pendingRole != "" {
+					delta["role"] = pendingRole
+					pendingRole = ""
+				}
 				if werr := writeChunk(delta, nativeFinish); werr != nil {
 					streamErr = werr
 					break
 				}
 			}
 			if strings.EqualFold(ev, "done") || strings.EqualFold(ev, "end") || strings.EqualFold(ev, "finish") {
+				if werr := flushRole(); werr != nil {
+					streamErr = werr
+					break
+				}
 				if nativeFinish == "" {
 					if werr := writeChunk(map[string]any{}, finish); werr != nil {
 						streamErr = werr
@@ -652,7 +678,11 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		}
 	}
 	if streamErr == nil && !sawDone {
-		streamErr = writeDONE(true)
+		if werr := flushRole(); werr != nil {
+			streamErr = werr
+		} else {
+			streamErr = writeDONE(true)
+		}
 	}
 	if streamErr == nil && onDone != nil {
 		onDone(completion())

@@ -642,7 +642,10 @@ type replayReadCloser struct {
 }
 
 // preflightSSE surfaces business errors before streaming starts. A role-only
-// chunk can precede a model rejection, so keep it buffered until the next event.
+// chunk can precede any upstream rejection, so keep it buffered until the next
+// event. Nothing has reached the client yet at this point (no content, reasoning
+// or tool_call), so every recognised business error stays a pre-stream error —
+// otherwise the role frame goes out first and the client sees 200 + SSE error.
 func preflightSSE(body io.ReadCloser) (io.ReadCloser, error) {
 	br := bufio.NewReaderSize(body, 1<<20)
 	var prefix bytes.Buffer
@@ -655,7 +658,7 @@ func preflightSSE(body io.ReadCloser) (io.ReadCloser, error) {
 			data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 			var payload map[string]any
 			_ = json.Unmarshal([]byte(data), &payload)
-			if apiErr := embeddedSSEError(payload); apiErr != nil && (!sawRole || isModelIDError(apiErr.Message)) {
+			if apiErr := embeddedSSEError(payload); apiErr != nil {
 				_ = body.Close()
 				return nil, apiErr
 			}
