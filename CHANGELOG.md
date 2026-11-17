@@ -2,6 +2,14 @@
 
 本文件记录本维护分支相对上游 [HITZY2002/codearts2api](https://github.com/HITZY2002/codearts2api) 的改动。
 
+## v1.0.3 — 2026-11-17
+
+### 修复
+
+- Windows 一键启动生成的 `config.json` 在 PowerShell 5.1 下会把 UTF-8 中文注释
+  读成乱码，导致 JSON 解析失败（`invalid character '"' after object key:value pair`）。
+  `make-config.ps1` 改为显式 UTF-8 读写；已用干净目录解压 v1.0.2 包复现并验证修复。
+
 ## v1.0.2 — 2026-11-17
 
 ### 上手体验

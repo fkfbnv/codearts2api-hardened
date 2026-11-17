@@ -15,13 +15,15 @@ if (-not (Test-Path "config.example.json")) {
 }
 
 $key = -join (1..48 | ForEach-Object { "{0:x}" -f (Get-Random -Maximum 16) })
-$text = Get-Content "config.example.json" -Raw
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+# Read as UTF-8 explicitly: Windows PowerShell 5.1 `Get-Content -Raw` uses the
+# ANSI codepage and mangles the Chinese comments, producing invalid JSON.
+$text = [System.IO.File]::ReadAllText((Join-Path $root "config.example.json"), $utf8)
 $text = $text.Replace('"api_key": ""', '"api_key": "' + $key + '"')
 # Local-only default: the panel page itself is unauthenticated, so bind loopback.
 # Docker / reverse-proxy setups should change it back to ":7866".
 $text = $text.Replace('"listen": ":7866"', '"listen": "127.0.0.1:7866"')
 
-$utf8 = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText((Join-Path $root "config.json"), $text, $utf8)
 [System.IO.File]::WriteAllText((Join-Path $root "api_key.txt"), $key, [System.Text.Encoding]::ASCII)
 
