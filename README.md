@@ -13,10 +13,28 @@
 
 感谢原作者的开源与优秀设计。
 
-## 快速开始（Ubuntu / Linux）
+## 本分支说明
+
+本仓库是 [HITZY2002/codearts2api](https://github.com/HITZY2002/codearts2api)（MIT）的**维护分支**，
+在其基础上做了以下改动（相对上游，详见 [CHANGELOG.md](CHANGELOG.md)）：
+
+- **官方 CLI 后端**：官方对裸 chat 调用加传输层加密后，部分模型直连返回 `TM.000010051`；
+  `internal/cli` 把命中模型的请求转给本地 `codearts serve`。默认关闭，需要时按
+  `cli_backend` 配置开启（`codearts_exe` 必填，或用 `CA2A_CLI_EXE`）。
+- **会话心跳**：直连路径按账号发送 busy/idle 心跳与稳定会话头，缓解上游并发闸。
+- **错误分类与账号池保护**：模型无权 / 参数非法 / 内容审查 / 网关超时分类处理，
+  不再因为一次 504 或一次 `81001` 冷却整池；成功请求会自动清掉早先的冷却与错误记录。
+- **预流错误返回真实状态码**：上游先发角色帧再拒绝时，不再退化成 `200 + SSE error`。
+- **请求体上限 8MB → 32MB**，图片/视频分片原样透传，`/v1/models` 过滤上游脏条目。
+- **签到**覆盖 PORTAL 通道并按活动 type 领取，模型目录缓存落盘。
+
+上游自 2026-11-11 后无新提交，本分支独立维护；具体差异以 `git log` 为准。
+
+## 快速开始
 
 ```bash
 make linux            # bin/ 下 4 个 Linux 静态二进制
+make windows          # 或 Windows：4 个 exe
 make test
 ```
 
@@ -169,6 +187,8 @@ docker compose up -d --build
 | `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
 | `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |
 | `CA2A_LOGIN_CLIENT_ID` | WebUI 登录使用的 OAuth client_id | 已有账号的取值，否则 `codearts-agent` |
+| `CA2A_MAX_BODY_MB` | 请求体上限（MB） | `32` |
+| `CA2A_CLI_EXE` | 官方 `codearts` CLI 可执行文件路径 | 空（CLI 后端无法启动） |
 
 ## 目录结构
 
@@ -179,6 +199,7 @@ cmd/credit/        账号登录态日报（新增并发信息）
 cmd/apply/         批量 token 续期（使用 pool 包）
 cmd/models/        查看账号可用模型（内置 + 限时福利，可选 -claim 领取）
 internal/auth/     auth 文件读写
+internal/cli/      官方 CLI 后端（codearts serve / opencode API）
 internal/upstream/ 云端客户端（登录/聊天/SSE/模型发现）+ 逆向常量
 internal/pool/     账号池（token 校验/自动刷新/冷却/并发控制）
 internal/scheduler/ token 续期看门狗（新增保活机制）
@@ -188,11 +209,30 @@ deploy/            systemd unit 样例
 docs/              逆向过程与接口清单
 ```
 
-## 免责声明
+## 使用边界与免责声明
 
-仅供学习和研究使用。使用者需遵守华为云服务条款，自行承担使用风险。
+本项目初衷是方便个人管理本人自愿授权的账号，不是为批量运营或商业牟利设计。
+
+允许的用途：
+
+- 管理你本人或亲属明确授权给你的华为云账号；
+- 在自己的设备或内网中学习、研究和自用。
+
+禁止的用途：
+
+- 批量注册、代注册、接码，以及买卖、出租或交易账号；
+- 盗号、撞库、绕过实名认证、风控或其他平台安全机制；
+- 将本项目或其派生服务用于对外收费、转售、引流或其他盈利性用途；
+- 任何违反华为云服务条款、当地法律法规或侵犯他人权益的用途。
+
+使用者应自行确认账号授权与使用方式合法合规。因滥用、误用或违反上述边界导致的
+封号、数据丢失、服务中断或法律责任，由使用者自行承担；项目作者与贡献者不对
+使用者的行为负责，也不提供任何形式的担保。
+
+本项目与华为云、CodeArts 官方无隶属或合作关系；相关商标归其权利人所有。
+项目按 MIT 许可「按现状」提供，上游服务变更可能导致本项目随时失效。
 
 ## License
 
-MIT
+MIT，见 [LICENSE](LICENSE)。原始版权归 HITZY2002；本分支改动版权归各提交作者。
 

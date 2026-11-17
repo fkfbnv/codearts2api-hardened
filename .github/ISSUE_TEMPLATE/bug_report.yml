@@ -1,0 +1,33 @@
+name: Bug report
+description: 反代行为异常（模型调用失败、签到、账号池状态）
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        本项目仅供个人自用，不提供代部署、账号代注册与定制开发。
+        提交前请先确认上游账号本身可用（官方客户端能正常对话）。
+        日志与配置请自行脱敏，**不要贴 api_key、refresh_token、cookie**。
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: Release tag 或 commit hash
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象
+      description: 期望结果与实际结果，能否稳定复现
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 证据
+      description: |
+        `/v1/models` 的返回状态与选中模型、`gw-launch.log.err` 末尾 20 行、
+        `data/state.json` 的账号状态。脱敏后再贴。
+    validations:
+      required: false
