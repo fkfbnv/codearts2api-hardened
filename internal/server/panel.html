@@ -67,6 +67,9 @@ input{font:inherit}
 .table tbody tr{transition:background .15s}
 .table tbody tr:hover td{background:rgba(255,255,255,.5)}
 .table td strong{font-variant-numeric:tabular-nums}
+/* 健康矩阵列多，中文/模型名不能被挤成竖排；靠外层 overflow-x 横向滚动 */
+#matrixTable{min-width:max-content}
+#matrixTable th,#matrixTable td{white-space:nowrap}
 .badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:700;border:1px solid transparent}
 .badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
 .badge.ok{background:rgba(22,163,74,.12);color:#15803d;border-color:rgba(22,163,74,.3)}
@@ -172,11 +175,51 @@ input{font:inherit}
             <th>账号</th>
             <th>签到 / 新手福利</th>
             <th>状态</th>
-            <th>原因 / 冷却至</th>
+            <th>原因 / 冷却</th>
+            <th>凭据 / 并发</th>
             <th>操作</th>
           </tr>
         </thead>
-        <tbody id="acctBody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
+        <tbody id="acctBody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h">
+      <h2>最近请求 / 错误</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="muted mono" id="recentUpdatedAt"></span>
+        <button class="btn" id="btnRecent" style="padding:6px 10px">刷新</button>
+      </div>
+    </div>
+    <div class="card-b" style="padding:0;overflow-x:auto">
+      <table class="table" id="recentTable">
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>模型</th>
+            <th>账号</th>
+            <th>来源</th>
+            <th>状态</th>
+            <th>耗时</th>
+            <th>错误</th>
+          </tr>
+        </thead>
+        <tbody id="recentBody"><tr><td colspan="7" class="empty">暂无记录</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h">
+      <h2>模型 × 账号健康</h2>
+      <span class="muted">点格子里的「探活」按需探测一次（会真实调用上游）</span>
+    </div>
+    <div class="card-b" style="padding:0;overflow-x:auto">
+      <table class="table" id="matrixTable">
+        <thead id="matrixHead"></thead>
+        <tbody id="matrixBody"><tr><td class="empty">加载中…</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -195,6 +238,11 @@ input{font:inherit}
         <span>API: <span class="mono">/v1/chat/completions</span></span>
       </div>
     </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>运行状态</h2></div>
+    <div class="card-b"><div class="chips" id="runtimeChips"></div></div>
   </div>
 </div>
 
@@ -294,6 +342,111 @@ function shortUID(u){
   return u.length > 14 ? u.slice(0,8) + "…" + u.slice(-4) : u;
 }
 
+function fmtCountdown(t){
+  if (!t || t.startsWith("0001-")) return "";
+  const ms = new Date(t).getTime() - Date.now();
+  if (!isFinite(ms)) return "";
+  if (ms <= 0) return "已到";
+  const s = Math.floor(ms/1000);
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), ss = s%60;
+  return (h ? h+"h " : "") + m + "m " + String(ss).padStart(2,"0") + "s";
+}
+
+function fmtBytes(n){
+  n = Number(n)||0;
+  if (n < 1024) return n + "B";
+  if (n < 1024*1024) return (n/1024).toFixed(1) + "KB";
+  return (n/1024/1024).toFixed(1) + "MB";
+}
+
+function availBadge(state, reason, at){
+  if (state === "usable") return `<span class="badge ok" title="可用">可用</span>`;
+  if (state === "unusable") return `<span class="badge bad" title="${escapeAttr(reason||"不可用")}">不可用</span>`;
+  const tip = at ? "上次状态已过期" : "尚未探测";
+  return `<span class="badge info" title="${escapeAttr(tip)}">未知</span>`;
+}
+
+function renderMatrix(data){
+  const av = data.availability || {};
+  const models = av.models || [];
+  const accounts = data.accounts || [];
+  const cells = av.cells || [];
+  const head = $("matrixHead");
+  const body = $("matrixBody");
+  if (!models.length || !accounts.length){
+    head.innerHTML = "";
+    body.innerHTML = `<tr><td class="empty">暂无账号或模型</td></tr>`;
+    return;
+  }
+  const byKey = new Map(cells.map(c => [String(c.uid||"") + "|" + String(c.model||"").toLowerCase(), c]));
+  head.innerHTML = `<tr><th>账号</th>${models.map(m => `<th><span class="mono">${escapeHtml(m)}</span></th>`).join("")}</tr>`;
+  body.innerHTML = accounts.map(a => {
+    const cellsHtml = models.map(m => {
+      const c = byKey.get(String(a.uid||"") + "|" + String(m).toLowerCase()) || {};
+      return `<td>
+        <div>${availBadge(c.state, c.reason, c.at)}</div>
+        ${c.probing ? '<div class="muted" style="font-size:11px"><span class="spin"></span>探测中</div>' : ""}
+        <button class="btn" data-act="probe" data-uid="${escapeAttr(a.uid||"")}" data-model="${escapeAttr(m)}"
+          style="padding:2px 6px;font-size:11px;margin-top:4px">探活</button>
+      </td>`;
+    }).join("");
+    return `<tr><td><strong>${escapeHtml(a.nickname || a.name || "未命名")}</strong>
+      <div class="mono muted" style="font-size:11px">${escapeHtml(shortUID(a.uid))}</div></td>${cellsHtml}</tr>`;
+  }).join("");
+}
+
+function renderRuntime(data){
+  const bl = data.body_limit || {};
+  const cli = data.cli || {};
+  const chips = [];
+  chips.push(`<span class="chip">本地上限 ${bl.local_mb ?? 32}MB · 413 ${bl.local_413 ?? 0}</span>`);
+  chips.push(`<span class="chip">上游上限 ${bl.upstream_mb ?? 10}MB · 413 ${bl.upstream_413 ?? 0}</span>`);
+  chips.push(`<span class="chip">最大请求 ${fmtBytes(bl.max_request_bytes)}</span>`);
+  if (bl.last_413_at) chips.push(`<span class="chip">最近 413 ${escapeHtml(fmtTime(bl.last_413_at))}</span>`);
+  chips.push(`<span class="chip">积分余额 未查询（上游福利通道已下线）</span>`);
+  if (!cli.enabled){
+    chips.push(`<span class="chip">CLI 后端 已关闭</span>`);
+  } else {
+    chips.push(`<span class="chip"><span class="badge ${cli.healthy ? "ok":"bad"}">${cli.healthy ? "健康":"异常"}</span> CLI ${escapeHtml(cli.endpoint || "—")}</span>`);
+    chips.push(`<span class="chip">CLI 模型 ${cli.model_count ?? 0} 个 · 多模态 ${escapeHtml((cli.multimodal_models||[]).join(", ") || "未配置")}</span>`);
+    if (cli.message) chips.push(`<span class="chip">${escapeHtml(cli.message)}</span>`);
+  }
+  $("runtimeChips").innerHTML = chips.join("");
+}
+
+function renderRecent(data){
+  const items = (data && data.items) || [];
+  const body = $("recentBody");
+  $("recentUpdatedAt").textContent = "更新于 " + new Date().toLocaleTimeString();
+  if (!items.length){
+    body.innerHTML = `<tr><td colspan="7" class="empty">暂无记录</td></tr>`;
+    return;
+  }
+  body.innerHTML = items.map(e => {
+    const st = Number(e.status) || 0;
+    const cls = st >= 500 ? "bad" : (st >= 400 ? "warn" : "ok");
+    const err = [e.code, e.kind, e.message].filter(Boolean).join(" · ");
+    return `<tr>
+      <td class="mono muted">${escapeHtml(fmtTime(e.time))}</td>
+      <td class="mono">${escapeHtml(e.model || "-")}</td>
+      <td class="muted">${escapeHtml(e.account || "-")}</td>
+      <td>${e.source === "cli" ? '<span class="badge info">CLI</span>' : '<span class="badge">直连</span>'}${e.stream ? ' <span class="muted">流</span>' : ""}</td>
+      <td><span class="badge ${cls}">${st}</span></td>
+      <td class="mono muted">${Number(e.duration_ms)||0}ms</td>
+      <td class="muted" title="${escapeAttr(err)}">${escapeHtml(err || "—")}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadRecent(){
+  try {
+    const data = await api("/admin/api/recent?limit=50");
+    renderRecent(data);
+  } catch (e) {
+    // 静默：轮询失败不打断面板；手动刷新时会 toast。
+  }
+}
+
 function render(data){
   const st = data.stats || {};
   $("sTotal").textContent = st.total ?? 0;
@@ -307,11 +460,12 @@ function render(data){
   const body = $("acctBody");
   const accounts = data.accounts || [];
   if (!accounts.length){
-    body.innerHTML = `<tr><td colspan="5" class="empty">暂无账号。点击右上角 <b>授权登录</b> 添加，或服务器运行 <span class="mono">./login.sh</span></td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="empty">暂无账号。点击右上角 <b>授权登录</b> 添加，或服务器运行 <span class="mono">./login.sh</span></td></tr>`;
   } else {
     body.innerHTML = accounts.map(a => {
       const reason = a.reason || "—";
       const until = a.cooling ? fmtTime(a.until) : "—";
+      const countdown = a.cooling ? fmtCountdown(a.cool_until || a.until) : "";
       return `<tr>
         <td>
           <div><strong>${escapeHtml(a.nickname || "未命名")}</strong></div>
@@ -319,7 +473,12 @@ function render(data){
         </td>
         <td><div class="${a.checkin && !a.checkin.ok ? 'muted' : ''}">${escapeHtml(a.checkin?.message || "尚未查询")}</div><div class="muted" style="font-size:11px">${a.checkin ? escapeHtml(fmtTime(a.checkin.checked_at)) : ""}</div></td>
         <td>${statusBadge(a)}${a.err_count?` <span class="badge info">err ${a.err_count}</span>`:""}</td>
-        <td><div class="muted">${escapeHtml(reason)}</div><div class="mono muted" style="font-size:11px">${escapeHtml(until)}</div></td>
+        <td><div class="muted">${escapeHtml(reason)}</div><div class="mono muted" style="font-size:11px">${escapeHtml(a.cooling ? `${until}${countdown ? "（剩 "+countdown+"）" : ""}` : until)}</div></td>
+        <td>
+          <div class="mono" style="font-size:12px">${escapeHtml(a.token_remaining || "—")}<span class="muted"> 剩余</span></div>
+          <div class="muted" style="font-size:11px">到期 ${escapeHtml(fmtTime(a.expires_at))}</div>
+          <div class="muted" style="font-size:11px">并发 ${a.active_concurrent ?? 0}/${a.max_concurrent ?? 0}</div>
+        </td>
         <td><div class="row-actions">
           <button class="btn" data-act="credits" data-uid="${escapeAttr(a.uid)}">校验</button>
           <button class="btn" data-act="checkin" data-uid="${escapeAttr(a.uid)}">签到</button>
@@ -331,6 +490,9 @@ function render(data){
       </tr>`;
     }).join("");
   }
+
+  renderMatrix(data);
+  renderRuntime(data);
 
   const models = data.models || [];
   $("modelCount").textContent = models.length + " 个";
@@ -362,6 +524,7 @@ async function showApp(){
   $("appView").classList.remove("hidden");
   try {
     await loadOverview();
+    await loadRecent();
   } catch (e) {
     toast("登录失败: " + e.message, false);
     clearKey();
@@ -572,6 +735,29 @@ $("oauthCopy").onclick = async () => {
     ta.remove();
   }
 };
+
+$("matrixBody").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-act='probe']");
+  if (!btn) return;
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>';
+  try {
+    const d = await api("/admin/api/probe", {method:"POST", body: JSON.stringify({uid: btn.dataset.uid, model: btn.dataset.model})});
+    toast(d.message || (d.state === "usable" ? "可用" : "完成"), d.state === "usable");
+    await loadOverview();
+  } catch (err) {
+    toast(err.message, false);
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+});
+
+$("btnRecent").onclick = async () => {
+  await loadRecent();
+  toast("已刷新");
+};
+setInterval(() => { if (!document.hidden) loadRecent(); }, 5000);
 
 // 经由 hub 反代时 hub 会自动注入服务 api_key，直接尝试加载；
 // 失败（如直连且未带 key）再回退到登录表单。

@@ -46,6 +46,9 @@ func New(base string, timeout time.Duration) *Client {
 	}
 }
 
+// Endpoint 返回 serve 的基地址（面板展示用）。
+func (c *Client) Endpoint() string { return c.base }
+
 // Healthy 检查 serve 是否在线。
 func (c *Client) Healthy(ctx context.Context) bool {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/session", nil)

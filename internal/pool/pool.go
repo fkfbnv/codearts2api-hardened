@@ -196,8 +196,31 @@ func (p *Pool) List() []map[string]any {
 		a.mu.Lock()
 		cooling := !a.disabled && now.Before(a.coolUntil)
 		until := ""
+		coolUntil := ""
+		if !a.coolUntil.IsZero() {
+			coolUntil = a.coolUntil.Format(time.RFC3339)
+		}
 		if cooling {
-			until = a.coolUntil.Format(time.RFC3339)
+			until = coolUntil
+		}
+		coolKind := ""
+		if cooling {
+			switch a.coolKind {
+			case CoolSoft:
+				coolKind = "soft"
+			case CoolErr:
+				coolKind = "error"
+			case CoolPlan:
+				coolKind = "plan"
+			}
+		}
+		lastValidated := ""
+		if !a.lastValidated.IsZero() {
+			lastValidated = a.lastValidated.Format(time.RFC3339)
+		}
+		refreshedAt := ""
+		if !a.refreshedAt.IsZero() {
+			refreshedAt = a.refreshedAt.Format(time.RFC3339)
 		}
 		reason := a.disabledReason
 		if reason == "" {
@@ -214,6 +237,8 @@ func (p *Pool) List() []map[string]any {
 			"disabled":          a.disabled,
 			"cooling":           cooling,
 			"until":             until,
+			"cool_until":        coolUntil,
+			"cool_kind":         coolKind,
 			"err_count":         a.errCount,
 			"reason":            reason,
 			"last_error":        a.lastErr,
@@ -221,6 +246,8 @@ func (p *Pool) List() []map[string]any {
 			"max_concurrent":    a.maxConcurrent,
 			"token_remaining":   a.Auth.Remaining().Round(time.Minute).String(),
 			"expires_at":        a.Auth.ExpiresAt().Format(time.RFC3339),
+			"last_validated":    lastValidated,
+			"refreshed_at":      refreshedAt,
 		})
 		a.mu.Unlock()
 	}

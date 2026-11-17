@@ -67,6 +67,12 @@ type Config struct {
 	CLIProvider string            // 例如 huaweicloud-maas
 	CLIAgent    string            // 例如 build
 	CLIModels   map[string]string // 小写 OpenAI 模型 ID -> CLI modelID
+	// CLIEnabled 配置里是否开启 CLI 后端（区分「没开」与「开了但没起来」）。
+	CLIEnabled bool
+	// CLIEndpoint 配置里的 serve 地址（面板展示用）。
+	CLIEndpoint string
+	// CLIMultimodal serve 侧配置的多模态模型列表（面板展示用）。
+	CLIMultimodal []string
 }
 
 var dynamicModelsCache struct {
@@ -138,6 +144,15 @@ type Handler struct {
 
 	loginMu sync.Mutex
 	logins  map[string]*pendingLogin
+
+	// 面板数据：最近请求、请求体统计、CLI 健康缓存。
+	recent *requestLog
+	stats  requestStats
+
+	cliMu      sync.Mutex
+	cliHealthy bool
+	cliChecked time.Time
+	cliErr     string
 }
 
 // pendingLogin WebUI 登录中间状态。
@@ -191,18 +206,24 @@ func NewHandler(cfg Config) *Handler {
 		cfg: cfg, mux: http.NewServeMux(), oauth: newOAuthStore(),
 		chats: map[string]string{}, logins: map[string]*pendingLogin{},
 		convAcct: map[string]string{},
+		recent:   newRequestLog(recentRequestsCap),
 	}
 	h.loadChats()
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	h.mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent) // 避免面板控制台刷 404
+	})
 	// WorkBuddy 风格控制台（页面不鉴权，API 走 Bearer）
 	h.mux.HandleFunc("GET /{$}", h.servePanel)
 	h.mux.HandleFunc("GET /admin", h.servePanel)
 	h.mux.HandleFunc("GET /panel", h.servePanel)
 	h.mux.HandleFunc("GET /panel/", h.servePanel)
 	h.mux.HandleFunc("GET /admin/api/overview", h.withAuth(h.adminOverview))
+	h.mux.HandleFunc("GET /admin/api/recent", h.withAuth(h.adminRecent))
+	h.mux.HandleFunc("POST /admin/api/probe", h.withAuth(h.adminProbe))
 	h.mux.HandleFunc("POST /admin/api/credits", h.withAuth(h.adminCredits))
 	h.mux.HandleFunc("POST /admin/api/checkin", h.withAuth(h.adminCheckin))
 	h.mux.HandleFunc("POST /admin/api/keepalive", h.withAuth(h.adminKeepalive))
@@ -830,23 +851,41 @@ func catalogHas(models []upstream.ModelInfo, wantLower string) bool {
 // ---------------------------------------------------------------------------
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	ri := &requestInfo{start: time.Now()}
+	sw := &statusWriter{ResponseWriter: w}
+	w = sw
+	r = r.WithContext(withRequestInfo(r.Context(), ri))
+	defer func() { h.recent.add(ri.entry(sw.code())) }()
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, h.cfg.MaxBodyBytes+1))
+	size := int64(len(body))
+	if r.ContentLength > size {
+		size = r.ContentLength // 413 时读取会被截断，长度以声明为准
+	}
+	h.noteBodySize(size)
+	ri.body = int(size)
 	if err != nil {
+		ri.note("invalid_request", "read body: "+err.Error())
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
 	if int64(len(body)) > h.cfg.MaxBodyBytes {
-		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large",
-			fmt.Sprintf("request body exceeds %dMB limit", h.cfg.MaxBodyBytes>>20))
+		msg := fmt.Sprintf("request body exceeds %dMB limit", h.cfg.MaxBodyBytes>>20)
+		h.note413(false)
+		ri.note("request_too_large", msg)
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", msg)
 		return
 	}
 	req, err := parseChatRequest(body)
 	if err != nil {
+		ri.note("invalid_request", err.Error())
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	ri.stream = req.Stream
 	tools, err := nativeTools(req.Tools, req.ToolChoice)
 	if err != nil {
+		ri.note("invalid_request", err.Error())
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -859,6 +898,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// 命中 CLI 后端的模型走 codearts serve；其余保持原直连路径。
 	if cliModel, ok := h.cliModelFor(req.Model); ok {
+		ri.source = "cli"
+		ri.model = req.Model
 		h.chatViaCLI(w, r, req, cliModel, affinity)
 		return
 	}
@@ -869,6 +910,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.Model != "" && req.Model != "auto" {
 		model = req.Model
 	}
+	ri.model = model
 
 	// OpenAI 线格式本身不携带会话 ID；conversationIDFor 用首条 user 消息
 	// 为整条 Agent 工具链固定 CodeArts 内置 chat_id 与账号亲和。V2 接口
@@ -885,6 +927,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 已经确认「所有健康账号都用不了这个模型」时直接快速失败：不必再打上游、
 	// 也不必把账号轮转一遍（轮转只会拿到同样的 not registered / benefit not found）。
 	if h.modelKnownUnusable(model) {
+		ri.note("model_not_available", "model "+model+" is not available on any configured account")
 		writeOpenAIError(w, http.StatusNotFound, "model_not_available",
 			"model "+model+" is not available on any configured account")
 		return
@@ -921,6 +964,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		tried[acct.Name] = true
+		ri.account = acct.Name
 
 		// 阻塞等待并发槽位（上游单账号并发会话释放慢，串行最稳）。
 		// 超时 180s 排队（5 个请求 × ~30s 上限），避免高并发立即失败跳号。
@@ -1071,12 +1115,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 本地预检：请求体超过上游 chat-completions 的 10MiB 硬上限。
 				// 上游对这类请求回 400 InferHub.001001005（「参数非法」），换账号/
 				// 换模型结果相同，所以不轮换、不冷却，直接给客户端一个说得清的 413。
+				h.note413(true)
+				ri.note("request_too_large", bodyLimit.Error())
 				writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", bodyLimit.Error())
 				return
 			}
 			if isParamInvalidError(serr) {
 				// Client request-param problem: rotating accounts yields the same 400,
-				// and cooling accounts takes down the whole pool for minutes.
+				// and cooling accounts takes down the pool for minutes.
+				ri.note("invalid_request", "upstream rejected request params: "+truncateMsg(serr.Error(), 200))
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
 					"upstream rejected request params: "+truncateMsg(serr.Error(), 200))
 				return
@@ -1085,7 +1132,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 上游内容审查拒绝：换账号、换措辞都未必过，但它是针对本次内容的
 				// 结论，不是账号故障。直接回 400 让客户端看到真实原因，别再让整池
 				// 陪跑 10 分钟冷却（1109 实测 81011.403 被当 5xx）。
-				h.handleUpstreamError(acct, model, serr) // 只记日志，不动账号
+				h.handleUpstreamError(ri, acct, model, serr) // 只记日志，不动账号
 				writeOpenAIError(w, http.StatusBadRequest, "content_filter",
 					"upstream content moderation rejected this request: "+truncateMsg(serr.Error(), 200))
 				return
@@ -1093,7 +1140,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if isGatewayTimeoutError(serr) {
 				// 网关后端超时（APIG.0203）：账号健康，只是这次请求上游 60s 没
 				// 出首字节。不冷却账号；多账号时换号再试，单账号直接给 504。
-				h.handleUpstreamError(acct, model, serr) // 只记日志，不动账号
+				h.handleUpstreamError(ri, acct, model, serr) // 只记日志，不动账号
 				if !h.hasFreshCandidate(model, tried) {
 					w.Header().Set("Retry-After", "20")
 					writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_timeout",
@@ -1103,7 +1150,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			lastErr = serr
-			if h.handleUpstreamError(acct, model, serr) {
+			if h.handleUpstreamError(ri, acct, model, serr) {
 				// 模型级错误：还有没试过的健康账号就先换号（多账号时 B 可能
 				// 有权限），全判死才给客户端明确答复。
 				if !h.hasFreshCandidate(model, tried) {
@@ -1152,7 +1199,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				var pre *upstream.PreStreamError
 				if errors.As(werr, &pre) {
 					kind, reason := classifyUpstreamError(pre.Err)
-					h.handleUpstreamError(acct, model, pre.Err)
+					h.handleUpstreamError(ri, acct, model, pre.Err)
 					if kind == errKindModelUnavailable && h.hasFreshCandidate(model, tried) {
 						// 响应头尚未写出，还有没试过的健康账号就直接换号重试
 						//（多账号时 B 可能有权限）。
@@ -1217,7 +1264,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 与直接上游错误路径保持一致：内容审查是「本次内容被拒」，不是账号
 				// 故障。以前这里只认参数错误，81011 被塞进 lastErr，轮转结束后变成
 				// 503 no_healthy_account，还把整池陪跑冷却。
-				h.handleUpstreamError(acct, model, aerr) // 只记日志，不动账号
+				h.handleUpstreamError(ri, acct, model, aerr) // 只记日志，不动账号
 				writeOpenAIError(w, http.StatusBadRequest, "content_filter",
 					"upstream content moderation rejected this request: "+truncateMsg(aerr.Error(), 200))
 				return
@@ -1225,7 +1272,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if isGatewayTimeoutError(aerr) {
 				// 网关后端超时（APIG.0203）：见流式路径同名分支——不冷却账号，
 				// 没有其它健康账号时直接回 504 让客户端稍后重试。
-				h.handleUpstreamError(acct, model, aerr) // 只记日志，不动账号
+				h.handleUpstreamError(ri, acct, model, aerr) // 只记日志，不动账号
 				if !h.hasFreshCandidate(model, tried) {
 					w.Header().Set("Retry-After", "20")
 					writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_timeout",
@@ -1239,7 +1286,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 未开通 / 福利过期 / APIG.0101 路由不存在）塞在 200 的 SSE 正文里，
 			// 于是点一个坏模型就把单账号池冷 10 分钟（1109 glm-5.3-flash 实测）。
 			// 统一走 handleUpstreamError 分类，和流式路径保持同一套判据。
-			if h.handleUpstreamError(acct, model, aerr) {
+			if h.handleUpstreamError(ri, acct, model, aerr) {
 				// 模型级错误：还有没试过的健康账号就先换号（多账号时 B 可能
 				// 有权限），全判死才给客户端明确答复。
 				if !h.hasFreshCandidate(model, tried) {
@@ -1289,6 +1336,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
 	}
+	ri.note("no_healthy_account", msg)
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 }
 
@@ -1478,8 +1526,9 @@ func buildCompletion(model, reasoning, content string, calls []openAIToolCall, f
 //
 // 分类见 availability.go 的 classifyUpstreamError；每个类别对账号状态的影响
 // 都在下面的 switch 里显式写明，不再靠猜 HTTP 状态码。
-func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err error) bool {
+func (h *Handler) handleUpstreamError(ri *requestInfo, acct *pool.Account, model string, err error) bool {
 	kind, reason := classifyUpstreamError(err)
+	ri.noteKind(kind.String(), reason)
 	switch kind {
 	case errKindModelUnavailable:
 		markUnusable(acct.UID, model, reason)
@@ -1713,6 +1762,16 @@ func (h *Handler) saveChats() {
 // CLI 后端（codearts serve）
 // ---------------------------------------------------------------------------
 
+// isCLIModelName 只按配置判断模型是否属于 CLI 后端（与 CLI 客户端是否就绪无关）。
+func (h *Handler) isCLIModelName(model string) bool {
+	key := strings.ToLower(strings.TrimSpace(model))
+	if key == "" {
+		key = strings.ToLower(h.cfg.DefaultModel)
+	}
+	_, ok := h.cfg.CLIModels[key]
+	return ok
+}
+
 // cliModelFor 判断该模型是否应由 CLI 后端处理，并返回 CLI 侧 modelID。
 func (h *Handler) cliModelFor(model string) (string, bool) {
 	if h.cfg.CLI == nil || len(h.cfg.CLIModels) == 0 {
@@ -1734,6 +1793,11 @@ func (h *Handler) cliModelFor(model string) (string, bool) {
 // 说明：CLI 是 agent 内核，回复是纯文本（不返回 tool_calls）。因此 CLI 路径
 // 不支持 OpenAI 工具调用，需要工具的场景请回退到直连模型（GLM-5.2）。
 func (h *Handler) chatViaCLI(w http.ResponseWriter, r *http.Request, req *chatRequest, cliModel, affinity string) {
+	ri := requestInfoFrom(r.Context())
+	if ri != nil {
+		ri.model = req.Model
+		ri.source = "cli"
+	}
 	convID := conversationIDFor(req, affinity)
 	prompt, images := promptAndImages(req.Messages)
 	// 带工具时：CLI 是 agent 内核、不返回 OpenAI tool_calls，因此按官方对 DSML
@@ -1763,6 +1827,7 @@ func (h *Handler) chatViaCLI(w http.ResponseWriter, r *http.Request, req *chatRe
 	})
 	if err != nil {
 		log.Printf("cli chat failed model=%s: %v", cliModel, err)
+		ri.note("upstream_error", "codearts cli: "+truncateMsg(err.Error(), 300))
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "codearts cli: "+truncateMsg(err.Error(), 300))
 		return
 	}

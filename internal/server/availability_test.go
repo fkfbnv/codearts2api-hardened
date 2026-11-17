@@ -186,7 +186,7 @@ func TestModelErrorDoesNotCoolAccount(t *testing.T) {
 		Code: 502, Status: 502, Path: "/api/v2/chat/completions",
 		Message: "InferHub.002002009.404 The model is not registered, please request other model",
 	}
-	if !h.handleUpstreamError(p.Get("u-cool"), "GLM-5.2-ArkTS-SPARK", err404) {
+	if !h.handleUpstreamError(nil, p.Get("u-cool"), "GLM-5.2-ArkTS-SPARK", err404) {
 		t.Error("模型级错误应返回 true，让调用方立即结束轮转")
 	}
 
@@ -214,7 +214,7 @@ func TestAPIG0101DoesNotCoolAccount(t *testing.T) {
 		Code: 502, Status: 502, Path: "/api/v2/chat/completions",
 		Message: "InferHub.APIG.0101.404 The API does not exist or has not been published in the environment",
 	}
-	if !h.handleUpstreamError(p.Get("u-apig"), "glm-5.3-flash", err502) {
+	if !h.handleUpstreamError(nil, p.Get("u-apig"), "glm-5.3-flash", err502) {
 		t.Error("APIG.0101 应判为模型级错误，让调用方立即结束轮转")
 	}
 	if !p.Healthy("u-apig") {
@@ -238,7 +238,7 @@ func TestContentModerationDoesNotPunishAccount(t *testing.T) {
 		Code: 502, Status: 502, Path: "/api/v2/chat/completions",
 		Message: "InferHub.ModelArts.81011.403 抱歉，我无法提供关于您提问内容的建议。",
 	}
-	if h.handleUpstreamError(p.Get("u-mod"), "deepseek-v4.1-flash", reject) {
+	if h.handleUpstreamError(nil, p.Get("u-mod"), "deepseek-v4.1-flash", reject) {
 		t.Error("内容审查不该返回 true（会下架模型）")
 	}
 	if !p.Healthy("u-mod") {
@@ -249,7 +249,7 @@ func TestContentModerationDoesNotPunishAccount(t *testing.T) {
 	}
 	// 阈值 1 的前提下连着被拒几次也不能触发错误累计冷却。
 	for i := 0; i < 3; i++ {
-		h.handleUpstreamError(p.Get("u-mod"), "deepseek-v4.1-flash", reject)
+		h.handleUpstreamError(nil, p.Get("u-mod"), "deepseek-v4.1-flash", reject)
 	}
 	if !p.Healthy("u-mod") {
 		t.Error("连续内容审查拒绝累计后仍不得冷却账号")
@@ -271,7 +271,7 @@ func TestGatewayTimeoutDoesNotCoolAccount(t *testing.T) {
 		Code: 504, Status: 504, Path: "/api/v2/chat/completions",
 		Message: `Backend timeout (error_code APIG.0203)`,
 	}
-	if h.handleUpstreamError(p.Get("u-to"), "deepseek-v4.1-flash-1017", timeout) {
+	if h.handleUpstreamError(nil, p.Get("u-to"), "deepseek-v4.1-flash-1017", timeout) {
 		t.Error("网关超时不该返回 true（会下架模型）")
 	}
 	if !p.Healthy("u-to") {
@@ -282,7 +282,7 @@ func TestGatewayTimeoutDoesNotCoolAccount(t *testing.T) {
 	}
 	// 阈值 1 的前提下连续超时多次也不能触发错误累计冷却。
 	for i := 0; i < 3; i++ {
-		h.handleUpstreamError(p.Get("u-to"), "deepseek-v4.1-flash-1017", timeout)
+		h.handleUpstreamError(nil, p.Get("u-to"), "deepseek-v4.1-flash-1017", timeout)
 	}
 	if !p.Healthy("u-to") {
 		t.Error("连续网关超时累计后仍不得冷却账号")

@@ -351,24 +351,59 @@ func upstreamUnavailableReason(err error) string {
 // 探测会占用上游会话槽位（单账号只有 3 个并发会话），因此这里必须走账号的并发锁：
 // 拿不到锁就让位给真实请求，等下一轮再试——否则用户请求会被探测挤成
 // TM.00001041「并发会话数已达上限」。
+// probeResult 单次探活的结果（面板手动探活与后台补结论共用）。
+type probeResult struct {
+	state   string // usable / unusable / unknown
+	reason  string
+	skipped bool
+	message string
+}
+
+// probeModel 后台补结论入口：保留原来的让位规则（账号忙/刚有真实流量就跳过），
+// 结果只写可用性缓存和日志，不返回给调用方。
 func (h *Handler) probeModel(acct *pool.Account, model string) {
-	if acct == nil || acct.Auth == nil {
-		return
+	res := h.probeModelOnce(context.Background(), acct, model, false)
+	switch res.state {
+	case "usable":
+		log.Printf("probe %s/%s: 可用", acct.Name, model)
+	case "unusable":
+		log.Printf("probe %s/%s: 不可用：%s", acct.Name, model, res.reason)
+	case "unknown":
+		if !res.skipped && res.message != "" {
+			log.Printf("probe %s/%s: 未判定 %s", acct.Name, model, res.message)
+		}
 	}
-	// 账号一旦有真实请求在跑（或刚跑过），本轮探测整体让位：探测只是为了让
-	// /v1/models 说真话，绝不能因此让用户请求排队等锁。下一轮再试。
-	if h.cfg.Pool.Busy(acct.Name) || trafficIdleFor(acct.UID) < probeIdleBefore {
-		return
+}
+
+// probeModelOnce 探测单个账号 + 单个模型。
+//
+// force=false：后台探测。账号忙或刚有真实流量时整体让位，避免挤掉用户请求。
+// force=true：面板手动探活。跳过让位判断（排障时账号往往正忙），但仍必须拿到
+// 账号并发锁；拿不到锁就返回 skipped，不排队等。
+func (h *Handler) probeModelOnce(ctx context.Context, acct *pool.Account, model string, force bool) probeResult {
+	if acct == nil || acct.Auth == nil {
+		return probeResult{state: "unknown", skipped: true, message: "账号未就绪"}
+	}
+	if h.isCLIModelName(model) {
+		return probeResult{state: "unknown", skipped: true, message: "CLI 后端模型，探活只走直连"}
+	}
+	if !force {
+		// 账号一旦有真实请求在跑（或刚跑过），本轮探测整体让位：探测只是为了让
+		// /v1/models 说真话，绝不能因此让用户请求排队等锁。下一轮再试。
+		if h.cfg.Pool.Busy(acct.Name) || trafficIdleFor(acct.UID) < probeIdleBefore {
+			return probeResult{state: "unknown", skipped: true, message: "账号忙或刚有流量，本轮让位"}
+		}
 	}
 	if !h.cfg.Pool.AcquireLock(acct.Name) {
-		return
+		return probeResult{state: "unknown", skipped: true, message: "并发槽位已满"}
 	}
 	defer h.cfg.Pool.ReleaseLock(acct.Name)
+
 	key := availKey(acct.UID, model)
 	availability.Lock()
 	if availability.probing[key] {
 		availability.Unlock()
-		return
+		return probeResult{state: "unknown", skipped: true, message: "该模型正在探测"}
 	}
 	availability.probing[key] = true
 	availability.Unlock()
@@ -380,21 +415,19 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 
 	token, ak, sk := acct.Auth.Credentials()
 	cred := upstream.SignCredential{AccessKeyID: ak, SecretAccessKey: sk, SecurityToken: token}
-	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	rc, err := acct.Client.ProbeModel(ctx, model, cred, upstream.IsBenefitModel(acct.UID, model))
+	rc, err := acct.Client.ProbeModel(pctx, model, cred, upstream.IsBenefitModel(acct.UID, model))
 	if err != nil {
 		// 并发上限是暂时的，不代表模型不可用。
 		if strings.Contains(err.Error(), "TM.00001041") {
-			return
+			return probeResult{state: "unknown", skipped: true, message: "并发上限，未判定"}
 		}
 		if reason := upstreamUnavailableReason(err); reason != "" {
 			markUnusable(acct.UID, model, reason)
-			log.Printf("probe %s/%s: 不可用：%s", acct.Name, model, reason)
-			return
+			return probeResult{state: "unusable", reason: reason}
 		}
-		log.Printf("probe %s/%s: 未判定 %v", acct.Name, model, err)
-		return
+		return probeResult{state: "unknown", message: err.Error()}
 	}
 	defer rc.Close()
 	// 读到首个事件即可：200 也要看内容，上游会把错误塞在 200 的 SSE 里。
@@ -410,14 +443,50 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 	headStr := head.String()
 	if reason := upstreamUnavailableReasonText(headStr); reason != "" {
 		markUnusable(acct.UID, model, reason)
-		log.Printf("probe %s/%s: 不可用：%s", acct.Name, model, reason)
-		return
+		return probeResult{state: "unusable", reason: reason}
 	}
 	if headStr == "" {
-		return
+		return probeResult{state: "unknown", message: "空响应"}
 	}
 	markUsable(acct.UID, model)
-	log.Printf("probe %s/%s: 可用", acct.Name, model)
+	return probeResult{state: "usable"}
+}
+
+// availabilitySnapshot 把「账号 × 模型」的可用性缓存拷成面板矩阵。
+// 超过 TTL 的条目标成 unknown，但保留 at 让面板显示状态是多久以前的。
+func availabilitySnapshot(accounts []map[string]any, models []string) []map[string]any {
+	availability.Lock()
+	defer availability.Unlock()
+	now := time.Now()
+	cells := make([]map[string]any, 0, len(accounts)*len(models))
+	for _, a := range accounts {
+		uid, _ := a["uid"].(string)
+		for _, m := range models {
+			key := availKey(uid, m)
+			e, ok := availability.byKey[key]
+			state, reason, at := "unknown", "", ""
+			if ok && !e.at.IsZero() {
+				at = e.at.Format(time.RFC3339)
+				if now.Sub(e.at) <= availabilityTTL {
+					switch e.state {
+					case availUsable:
+						state = "usable"
+					case availUnusable:
+						state, reason = "unusable", e.reason
+					}
+				}
+			}
+			cells = append(cells, map[string]any{
+				"uid":     uid,
+				"model":   m,
+				"state":   state,
+				"reason":  reason,
+				"at":      at,
+				"probing": availability.probing[key],
+			})
+		}
+	}
+	return cells
 }
 
 // upstreamUnavailableReasonText 同 upstreamUnavailableReason，作用于响应正文。

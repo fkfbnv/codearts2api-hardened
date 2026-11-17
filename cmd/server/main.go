@@ -140,6 +140,9 @@ func main() {
 		CLIProvider:       cfg.CLIBackend.Provider,
 		CLIAgent:          cfg.CLIBackend.Agent,
 		CLIModels:         cfg.CLIBackend.Models,
+		CLIEnabled:        cfg.CLIBackend.Enabled,
+		CLIEndpoint:       cfg.CLIBackend.Endpoint,
+		CLIMultimodal:     cfg.CLIBackend.MultimodalModels,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
