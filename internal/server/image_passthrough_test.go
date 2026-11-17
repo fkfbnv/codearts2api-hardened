@@ -74,6 +74,47 @@ func TestZCodeImagePartReachUpstream(t *testing.T) {
 	}
 }
 
+// 视频分片必须保留。以前 hasImage 只由图片置位，纯视频消息整体退回拍平文本，
+// 上游只能看到「没有附件」（kimi 实测回 "I don't see a video attached"）。
+func TestVideoPartReachUpstream(t *testing.T) {
+	for _, body := range []string{
+		`{"model":"kimi-k3.1-pro","messages":[{"role":"user","content":[
+			{"type":"text","text":"描述视频"},
+			{"type":"video_url","video_url":{"url":"data:video/mp4;base64,aGVsbG8="}}
+		]}]}`,
+		// 纯视频（无文本分片）也必须保留成数组
+		`{"model":"kimi-k3.1-pro","messages":[{"role":"user","content":[
+			{"type":"video_url","video_url":{"url":"data:video/mp4;base64,aGVsbG8="}}
+		]}]}`,
+		// ZCode 的分片形状必须被转成 video_url（上游只认这个类型名）
+		`{"model":"kimi-k3.1-pro","messages":[{"role":"user","content":[
+			{"type":"text","text":"描述视频"},
+			{"type":"video","mediaType":"video/mp4","dataUrl":"data:video/mp4;base64,aGVsbG8="}
+		]}]}`,
+	} {
+		req, err := parseChatRequest([]byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		msgs := buildUpstreamMessages(req, false)
+		parts, ok := msgs[0].Content.([]map[string]any)
+		if !ok {
+			t.Fatalf("content type=%T, want []map[string]any", msgs[0].Content)
+		}
+		found := false
+		for _, p := range parts {
+			if p["type"] == "video_url" {
+				if m, ok := p["video_url"].(map[string]any); ok && m["url"] == "data:video/mp4;base64,aGVsbG8=" {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("video part lost: %#v", parts)
+		}
+	}
+}
+
 // 纯文本消息必须维持原来的字符串 content，行为不变。
 func TestPlainTextStillFlattened(t *testing.T) {
 	body := []byte(`{"model":"x","messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}`)

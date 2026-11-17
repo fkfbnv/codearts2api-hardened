@@ -84,7 +84,7 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		Model:           raw.Model,
 		Stream:          raw.Stream,
 		IncludeUsage:    raw.StreamOptions.IncludeUsage,
-		ReasoningEffort: strings.ToLower(strings.TrimSpace(raw.ReasoningEffort)),
+		ReasoningEffort: normalizeReasoningEffort(raw.ReasoningEffort),
 		MaxTokens:       raw.MaxTokens,
 		Temperature:     raw.Temperature,
 		TopP:            raw.TopP,
@@ -132,6 +132,28 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		return nil, errors.New("no user or tool message found")
 	}
 	return req, nil
+}
+
+// normalizeReasoningEffort 把客户端的思考档位归一成上游认识的值。
+//
+// 上游（InferHub）对「始终思考」的模型只接受 low / high / max。客户端用
+// none、off、disabled 之类表示关闭思考时，上游直接回
+//   502 InferHub.ModelArts.81001.400 该模型始终思考，不支持关闭思考；请使用 low、high 或 max。
+// 这个 502 曾把单账号池整池冷却 10 分钟（2026-11-15 22:23 实测）。关闭思考在这类
+// 模型上物理做不到，因此把「关闭」降级成最低档 low；无法识别的档位同样按 low 处理，
+// 只有 medium 归到 high（上游不接受 medium）。
+func normalizeReasoningEffort(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	switch v {
+	case "":
+		return ""
+	case "low", "high", "max":
+		return v
+	case "medium":
+		return "high"
+	default:
+		return "low"
+	}
 }
 
 // parseMessage 解析单条消息：content 支持 string 与 [{type:text,text}] 分片；
@@ -200,7 +222,7 @@ func flattenContent(raw json.RawMessage) string {
 	return ""
 }
 
-// imageContentParts 在 content 含图片时保留原始 OpenAI 分片。
+// imageContentParts 在 content 含图片/视频时保留原始 OpenAI 分片。
 // 纯文本消息返回 nil，走原来的 Text 路径，避免改动既有行为。
 func imageContentParts(raw json.RawMessage) any {
 	var parts []map[string]any
@@ -208,7 +230,7 @@ func imageContentParts(raw json.RawMessage) any {
 		return nil
 	}
 	out := make([]map[string]any, 0, len(parts))
-	hasImage := false
+	hasMedia := false
 	for _, p := range parts {
 		typ, _ := p["type"].(string)
 		switch typ {
@@ -276,7 +298,22 @@ func imageContentParts(raw json.RawMessage) any {
 				wire["detail"] = d
 			}
 			out = append(out, wire)
-			hasImage = true
+			hasMedia = true
+		// 视频分片必须转成上游唯一认识的 video_url 形状：
+		//   - 上游对 {"type":"video",...} 直接回 502「invalid part type: video」；
+		//   - 以前 hasMedia 只由图片置位，纯视频消息会整体退回拍平文本
+		//     （kimi 实测回 "I don't see a video attached"）。
+		// ZCode 的形状是 {"type":"video","mediaType":"video/mp4","dataUrl":"data:video/mp4;base64,..."}。
+		case "video_url", "video", "input_video":
+			url := inlineVideoURL(p)
+			if url == "" {
+				continue
+			}
+			out = append(out, map[string]any{
+				"type":      "video_url",
+				"video_url": map[string]any{"url": url},
+			})
+			hasMedia = true
 		case "text", "input_text":
 			txt := p["text"]
 			if txt == nil {
@@ -289,10 +326,59 @@ func imageContentParts(raw json.RawMessage) any {
 			out = append(out, p)
 		}
 	}
-	if !hasImage {
+	if !hasMedia {
 		return nil
 	}
 	return out
+}
+
+// inlineVideoURL 从各种视频分片形状里取出可用的 URL（data: 或 http）。
+// 兼容 OpenAI 的 video_url、ZCode 的 {mediaType,dataUrl}、裸 base64 与
+// Anthropic 风格的 source 包装。取不到返回空串，该分片丢弃。
+func inlineVideoURL(p map[string]any) string {
+	for _, k := range []string{"video_url", "videoUrl", "dataUrl", "url"} {
+		switch v := p[k].(type) {
+		case string:
+			if v != "" {
+				return v
+			}
+		case map[string]any:
+			if s, _ := v["url"].(string); s != "" {
+				return s
+			}
+		}
+	}
+	if data, ok := p["data"].(string); ok && data != "" {
+		mt, _ := p["mediaType"].(string)
+		if mt == "" {
+			mt, _ = p["mimeType"].(string)
+		}
+		if mt == "" {
+			mt = "video/mp4"
+		}
+		return "data:" + mt + ";base64," + data
+	}
+	if src, ok := p["source"].(map[string]any); ok {
+		for _, k := range []string{"dataUrl", "url"} {
+			if s, _ := src[k].(string); s != "" {
+				return s
+			}
+		}
+		if data, ok := src["data"].(string); ok && data != "" {
+			mt, _ := src["media_type"].(string)
+			if mt == "" {
+				mt, _ = src["mediaType"].(string)
+			}
+			if mt == "" {
+				mt, _ = src["mimeType"].(string)
+			}
+			if mt == "" {
+				mt = "video/mp4"
+			}
+			return "data:" + mt + ";base64," + data
+		}
+	}
+	return ""
 }
 
 // rawJSONString 把 arguments 统一成 JSON 字符串（兼容字符串与对象两种线格式）。

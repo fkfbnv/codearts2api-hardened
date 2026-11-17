@@ -137,6 +137,39 @@ func TestParseChatRequest(t *testing.T) {
 	}
 }
 
+func TestNormalizeReasoningEffort(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"low", "low"},
+		{"HIGH", "high"},
+		{" max ", "max"},
+		{"medium", "high"},
+		{"none", "low"},
+		{"off", "low"},
+		{"disabled", "low"},
+		{"minimal", "low"},
+		{"auto", "low"},
+	}
+	for _, c := range cases {
+		if got := normalizeReasoningEffort(c.in); got != c.want {
+			t.Errorf("normalizeReasoningEffort(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestParseChatRequestNormalizesDisabledThinking(t *testing.T) {
+	// ZCode 选「none」思考档时发 reasoning_effort=none；上游「始终思考」的模型
+	// 会回 502 并把整池冷 10 分钟。解析层必须把它降级成 low。
+	body := `{"model":"glm-5.3-flash","reasoning_effort":"none","messages":[{"role":"user","content":"hi"}]}`
+	req, err := parseChatRequest([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.ReasoningEffort != "low" {
+		t.Fatalf("reasoning_effort none should normalize to low, got %q", req.ReasoningEffort)
+	}
+}
+
 func TestParseChatRequestErrors(t *testing.T) {
 	if _, err := parseChatRequest([]byte(`{}`)); err == nil {
 		t.Fatal("expected error for empty messages")
