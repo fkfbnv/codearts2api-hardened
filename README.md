@@ -21,6 +21,10 @@
 - **官方 CLI 后端**：官方对裸 chat 调用加传输层加密后，部分模型直连返回 `TM.000010051`；
   `internal/cli` 把命中模型的请求转给本地 `codearts serve`。默认关闭，需要时按
   `cli_backend` 配置开启（`codearts_exe` 必填，或用 `CA2A_CLI_EXE`）。
+  图片以 opencode `file` 分片（`data:` URL）随消息发送；CLI 需要
+  `cli_backend.multimodal_models` 指定 serve 侧视觉模型，否则 CLI 的
+  `analyzeImage` 会报「未获取到可用的多模态模型」。视频与远程 http(s) 图片不发送，
+  prompt 里会明确说明。
 - **会话心跳**：直连路径按账号发送 busy/idle 心跳与稳定会话头，缓解上游并发闸。
 - **错误分类与账号池保护**：模型无权 / 参数非法 / 内容审查 / 网关超时分类处理，
   不再因为一次 504 或一次 `81001` 冷却整池；成功请求会自动清掉早先的冷却与错误记录。

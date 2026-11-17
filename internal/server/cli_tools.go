@@ -7,15 +7,35 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"codearts2api/internal/cli"
 )
 
-// promptFromMessages 把 OpenAI 消息序列拍成 CLI 能理解的单段 prompt。
-func promptFromMessages(msgs []openAIMessage) string {
+// CLI 通道的图片附件上限。超过时在 prompt 里明说「未发送」，不静默丢图
+// （静默丢图会让模型去找读图工具，历史上因此连环翻车）。
+const (
+	cliMaxImages     = 8
+	cliMaxImageBytes = 12 << 20 // 单张 data URL 字符数
+	cliMaxImageTotal = 24 << 20
+)
+
+// promptAndImages 把 OpenAI 消息序列拍成 CLI 能理解的单段 prompt，同时抽出
+// 可以走 opencode file 分片直传的图片。
+//
+// 拍平文本与图片附件是同一条会话消息的两部分：文本进 prompt，图片按
+// `{type:"file", mime, filename, url}` 附在同一个 POST /message 上（opencode
+// 的 file part 认 data: URL）。Image.Offset 记录图片所属消息在 prompt 中的
+// 起始偏移，供客户端做增量过滤。
+func promptAndImages(msgs []openAIMessage) (string, []cli.Image) {
 	var sb strings.Builder
+	var images []cli.Image
+	imgNo, attach, total := 0, 0, 0
+
 	for _, m := range msgs {
 		if m.Text == "" && m.Content == nil && len(m.ToolCalls) == 0 {
 			continue
 		}
+		start := sb.Len()
 		switch m.Role {
 		case "system":
 			sb.WriteString("[系统]\n")
@@ -32,19 +52,150 @@ func promptFromMessages(msgs []openAIMessage) string {
 				sb.WriteString("\n")
 			}
 		}
-		// CLI 通道带不了图片（prompt 是纯文本）。以前图片被静默丢弃，模型
-		// 看到用户在谈截图却收不到图，就会去找/发明读图工具（实测复现：
-		// LocalToolSearch{"query":"select:analyzeImage"} → 连环执行失败）。
-		// 显式声明看不到图，让它直接用文本回答。
-		if m.Content != nil {
-			sb.WriteString("[图片：用户发送了图片附件，本通道无法传图，你看不到图片内容。请基于已有文字直接回答，或用文字向用户说明需要贴出文字内容；不要寻找或调用读图工具。]\n")
+		for _, p := range messageParts(m.Content) {
+			typ, _ := p["type"].(string)
+			switch typ {
+			case "image_url", "image":
+				imgNo++
+				mime, url, ok := imageDataURL(p)
+				if !ok {
+					fmt.Fprintf(&sb, "[图片 %d：不是可内联发送的图片（需要 data: URL），本通道未发送。]\n", imgNo)
+					continue
+				}
+				if attach >= cliMaxImages {
+					fmt.Fprintf(&sb, "[图片 %d：超出单次附件数量上限（%d 张），未发送。]\n", imgNo, cliMaxImages)
+					continue
+				}
+				if len(url) > cliMaxImageBytes || total+len(url) > cliMaxImageTotal {
+					fmt.Fprintf(&sb, "[图片 %d：超出附件大小上限，未发送；请要求用户压缩后再发。]\n", imgNo)
+					continue
+				}
+				attach++
+				total += len(url)
+				images = append(images, cli.Image{
+					MIME:     mime,
+					Filename: imageFilename(mime, attach),
+					URL:      url,
+					Offset:   start,
+				})
+				fmt.Fprintf(&sb, "[图片 %d：已随本消息以附件发送。]\n", imgNo)
+			case "video_url", "video", "input_video":
+				sb.WriteString("[视频：本通道无法接收视频，未发送；请用文字描述关键画面。]\n")
+			}
 		}
 		for _, c := range m.ToolCalls {
 			sb.WriteString("调用工具 " + c.Name + "(" + c.Arguments + ")\n")
 		}
 		sb.WriteString("\n")
 	}
-	return sb.String()
+	return sb.String(), images
+}
+
+// messageParts 取消息的原始分片数组（解析阶段存的是 []map[string]any）。
+func messageParts(v any) []map[string]any {
+	if v == nil {
+		return nil
+	}
+	if parts, ok := v.([]map[string]any); ok {
+		return parts
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var parts []map[string]any
+	if json.Unmarshal(raw, &parts) != nil {
+		return nil
+	}
+	return parts
+}
+
+// imageDataURL 从各种图片分片形状里取出内联 data: URL 与 MIME。
+// 覆盖 OpenAI image_url、ZCode {mediaType,dataUrl}、裸 base64、
+// Anthropic source 包装；http(s) 远程图返回 ok=false（CLI 通道不代下载）。
+func imageDataURL(p map[string]any) (mime, url string, ok bool) {
+	url = imageURL(p)
+	if !strings.HasPrefix(url, "data:") {
+		return "", "", false
+	}
+	mime = dataURLMime(url)
+	if mime == "" || !strings.HasPrefix(mime, "image/") {
+		return "", "", false
+	}
+	return mime, url, true
+}
+
+func imageURL(p map[string]any) string {
+	for _, k := range []string{"image_url", "imageUrl", "image"} {
+		switch v := p[k].(type) {
+		case string:
+			if v != "" {
+				return v
+			}
+		case map[string]any:
+			for _, kk := range []string{"url", "dataUrl"} {
+				if s, _ := v[kk].(string); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	for _, k := range []string{"dataUrl", "url"} {
+		if s, ok := p[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	if data, ok := p["data"].(string); ok && data != "" {
+		return "data:" + firstString(p["mediaType"], p["mimeType"], "image/png") + ";base64," + data
+	}
+	if src, ok := p["source"].(map[string]any); ok {
+		for _, k := range []string{"dataUrl", "url"} {
+			if s, _ := src[k].(string); s != "" {
+				return s
+			}
+		}
+		if data, ok := src["data"].(string); ok && data != "" {
+			return "data:" + firstString(src["media_type"], src["mediaType"], src["mimeType"], "image/png") + ";base64," + data
+		}
+	}
+	return ""
+}
+
+func firstString(vals ...any) string {
+	for _, v := range vals {
+		if s, ok := v.(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// dataURLMime 取 data: URL 的媒体类型并归一（image/jpg → image/jpeg）。
+func dataURLMime(u string) string {
+	rest := strings.TrimPrefix(u, "data:")
+	if i := strings.IndexByte(rest, ';'); i >= 0 {
+		rest = rest[:i]
+	} else if i := strings.IndexByte(rest, ','); i >= 0 {
+		rest = rest[:i]
+	}
+	rest = strings.TrimSpace(rest)
+	if strings.EqualFold(rest, "image/jpg") {
+		rest = "image/jpeg"
+	}
+	return rest
+}
+
+func imageFilename(mime string, n int) string {
+	ext := ".png"
+	switch strings.ToLower(mime) {
+	case "image/jpeg":
+		ext = ".jpg"
+	case "image/webp":
+		ext = ".webp"
+	case "image/gif":
+		ext = ".gif"
+	}
+	return fmt.Sprintf("image-%d%s", n, ext)
 }
 
 // streamCLIText 把完整文本按块伪流式返回（CLI 这条路径不提供增量事件）。

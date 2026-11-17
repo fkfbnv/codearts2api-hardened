@@ -61,6 +61,34 @@ func (c *Client) Healthy(ctx context.Context) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
+// SetMultimodalModels 把多模态模型列表写进 serve 的全局配置（PATCH /v1/config）。
+//
+// 为什么必须这么做：CLI 的 ImageAnalyzePlugin 默认把图片换成 ImageId，交给
+// analyzeImage 工具，由它再找一个"多模态模型"；这个列表为空时工具直接报
+// 「未获取到可用的多模态模型」，图片等于白传。列表里写了某个模型后，
+// analyzeImage 就用它做视觉推理（2026-11-17 实测：kimi-k3.1-pro 能读出图中文字）。
+func (c *Client) SetMultimodalModels(ctx context.Context, models []string) error {
+	if len(models) == 0 {
+		return nil
+	}
+	raw, _ := json.Marshal(map[string]any{"multimodalModels": models})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.base+"/v1/config", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("patch /v1/config %d: %s", resp.StatusCode, truncate(string(data), 300))
+	}
+	return nil
+}
+
 // ChatRequest 一次对话请求。
 type ChatRequest struct {
 	ConversationID string
@@ -68,6 +96,20 @@ type ChatRequest struct {
 	Model          string
 	Agent          string
 	Prompt         string
+	// Images 是随本轮 prompt 一起发送的图片附件（data: URL）。
+	//
+	// Offset 记录该图片所属消息在完整 prompt 里的起始字节偏移。会话复用时
+	// 客户端只发增量文本，图片也按同一把尺子过滤：只发 Offset 落在增量区间
+	// 里的，避免每轮把历史图片重传一遍（token 与带宽都会翻倍）。
+	Images []Image
+}
+
+// Image 一张以 data: URL 内联的图片附件（opencode file part）。
+type Image struct {
+	MIME     string
+	Filename string
+	URL      string
+	Offset   int
 }
 
 // ChatResult 一次对话结果。
@@ -91,6 +133,7 @@ type Part struct {
 func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResult, error) {
 	sid, _ := c.session(req.ConversationID)
 	prompt := req.Prompt
+	images := req.Images
 	if sid != "" {
 		// 已有 CLI session：尝试只发增量。历史被改写（前缀不匹配，例如工具
 		// 集变化或客户端重排消息）时弃旧会话、按全量重建。
@@ -98,9 +141,12 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResult, error)
 		prev, ok := c.lastPrompt[req.ConversationID]
 		c.mu.Unlock()
 		if ok && strings.HasPrefix(req.Prompt, prev) {
-			if delta := strings.TrimSpace(req.Prompt[len(prev):]); delta != "" {
+			cutoff := len(prev)
+			if delta := strings.TrimSpace(req.Prompt[cutoff:]); delta != "" {
 				prompt = "\n" + delta
 			}
+			// 图片跟着文本走同一条增量边界：只发本轮新增消息里的图。
+			images = imagesFrom(images, cutoff)
 		} else if ok {
 			c.dropSession(req.ConversationID)
 			sid = ""
@@ -115,9 +161,19 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResult, error)
 		}
 	}
 
+	parts := make([]any, 0, 1+len(images))
+	parts = append(parts, map[string]any{"type": "text", "text": prompt})
+	for _, img := range uniqueImages(images) {
+		parts = append(parts, map[string]any{
+			"type":     "file",
+			"mime":     img.MIME,
+			"filename": img.Filename,
+			"url":      img.URL,
+		})
+	}
 	body := map[string]any{
 		"model": map[string]any{"providerID": req.Provider, "modelID": req.Model},
-		"parts": []any{map[string]any{"type": "text", "text": prompt}},
+		"parts": parts,
 	}
 	if req.Agent != "" {
 		body["agent"] = req.Agent
@@ -225,4 +281,32 @@ func truncate(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// imagesFrom 取增量区间内的图片（Offset >= cutoff）。
+func imagesFrom(images []Image, cutoff int) []Image {
+	out := make([]Image, 0, len(images))
+	for _, img := range images {
+		if img.Offset >= cutoff {
+			out = append(out, img)
+		}
+	}
+	return out
+}
+
+// uniqueImages 同一请求里重复的内联图片只发一次（客户端常把同图贴两次）。
+func uniqueImages(images []Image) []Image {
+	if len(images) < 2 {
+		return images
+	}
+	seen := make(map[string]struct{}, len(images))
+	out := make([]Image, 0, len(images))
+	for _, img := range images {
+		if _, ok := seen[img.URL]; ok {
+			continue
+		}
+		seen[img.URL] = struct{}{}
+		out = append(out, img)
+	}
+	return out
 }

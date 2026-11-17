@@ -48,6 +48,10 @@
       "kimi-k3.1-pro": "kimi-k3.1-pro",
       "openpangu-2.0-flash": "openpangu-2.0-flash",
       "openpangu-2.0-pro": "openpangu-2.0-pro"
-    }
+    },
+    // serve 侧的多模态模型列表（PATCH /v1/config 的 multimodalModels）。
+    // 留空 = 不动；写了视觉模型后，CLI 的 analyzeImage 工具就用它做视觉推理；
+    // 否则工具找不到模型，会报「未获取到可用的多模态模型」。
+    "multimodal_models": ["kimi-k3.1-pro"]
   }
 }

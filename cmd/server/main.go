@@ -80,6 +80,16 @@ func main() {
 			cliClient = cli.New(cfg.CLIBackend.Endpoint, timeout)
 			log.Printf("cli backend ready: %s provider=%s models=%d",
 				cfg.CLIBackend.Endpoint, cfg.CLIBackend.Provider, len(cfg.CLIBackend.Models))
+			if len(cfg.CLIBackend.MultimodalModels) > 0 {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				err := cliClient.SetMultimodalModels(ctx, cfg.CLIBackend.MultimodalModels)
+				cancel()
+				if err != nil {
+					log.Printf("cli multimodal config failed: %v (images may not reach the model)", err)
+				} else {
+					log.Printf("cli multimodal models: %v", cfg.CLIBackend.MultimodalModels)
+				}
+			}
 		}
 	}
 

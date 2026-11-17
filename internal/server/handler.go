@@ -1735,13 +1735,20 @@ func (h *Handler) cliModelFor(model string) (string, bool) {
 // 不支持 OpenAI 工具调用，需要工具的场景请回退到直连模型（GLM-5.2）。
 func (h *Handler) chatViaCLI(w http.ResponseWriter, r *http.Request, req *chatRequest, cliModel, affinity string) {
 	convID := conversationIDFor(req, affinity)
-	prompt := promptFromMessages(req.Messages)
+	prompt, images := promptAndImages(req.Messages)
 	// 带工具时：CLI 是 agent 内核、不返回 OpenAI tool_calls，因此按官方对 DSML
 	// 模型的做法把工具 schema 注入 prompt，要求模型输出 ```tool_call 代码块，
 	// 再由 toolResponse 解析成标准 tool_calls。
 	toolsOn := len(req.Tools) > 0 && req.ToolChoice.Mode != "none"
 	if toolsOn {
-		prompt = toolPrompt(prompt, req.Tools, req.ToolChoice)
+		wrapped := toolPrompt(prompt, req.Tools, req.ToolChoice)
+		// 工具规则是前置的：图片 Offset 是按未包装的 prompt 算的，要整体后移，
+		// 否则增量过滤会误判图片是否属于本轮。
+		shift := len(wrapped) - len(prompt)
+		for i := range images {
+			images[i].Offset += shift
+		}
+		prompt = wrapped
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 300*time.Second)
 	defer cancel()
@@ -1752,6 +1759,7 @@ func (h *Handler) chatViaCLI(w http.ResponseWriter, r *http.Request, req *chatRe
 		Model:          cliModel,
 		Agent:          h.cfg.CLIAgent,
 		Prompt:         prompt,
+		Images:         images,
 	})
 	if err != nil {
 		log.Printf("cli chat failed model=%s: %v", cliModel, err)

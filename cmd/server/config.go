@@ -94,6 +94,11 @@ type Config struct {
 		CredentialsFile string            `json:"credentials_file"`
 		TimeoutSeconds  int               `json:"timeout_seconds"`
 		Models          map[string]string `json:"models"` // 小写 OpenAI ID -> CLI modelID
+		// MultimodalModels 是 serve 侧的多模态模型列表（写进 /v1/config 的
+		// multimodalModels）。CLI 默认把图片转成 ImageId 交给 analyzeImage 工具，
+		// 再由它找"可用的多模态模型"——列表为空时这一步必然失败。把要用的
+		// 视觉模型写在这里，analyzeImage 就用它做视觉推理。
+		MultimodalModels []string `json:"multimodal_models"`
 	} `json:"cli_backend"`
 
 	SoftRateDur    time.Duration
