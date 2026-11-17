@@ -3,6 +3,7 @@ data/
 bin/
 config.json
 .env
+gw.log
 *.key
 *.pem
 *.exe

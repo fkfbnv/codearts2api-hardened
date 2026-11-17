@@ -34,6 +34,25 @@
 
 上游自 2026-11-11 后无新提交，本分支独立维护；具体差异以 `git log` 为准。
 
+## 给 AI agent 的入口
+
+如果 agent 拿到这个仓库地址，按顺序执行，不要跳步：
+
+1. 读本文件「快速开始」与 `config.example.json`；不要凭文件名猜配置项。
+2. 有终端且装了 Go：`git clone` 后 `make windows`（或 `make linux`）；没装 Go：
+   从 Releases 下载 `codearts2api-windows.zip`，解压即用。
+3. 生成 `config.json`：复制 `config.example.json`，填一个 48 位随机 `api_key`；
+   Windows 上直接跑 `start.cmd` 会自动完成这一步并写出 `api_key.txt`。
+4. 登录必须由账号主人完成（浏览器 OAuth，`login.sh` 或 `bin\codearts2api-login.exe`），
+   agent 不要索要或代填账号密码。
+5. 启动后验证：`GET /healthz` 返回 `ok`；`GET /v1/models` 带
+   `Authorization: Bearer <api_key>` 返回 200。
+6. 面板 `http://127.0.0.1:7866/panel` 用 api_key 登录；矩阵里的「探活」会真实
+   消耗一次上游调用，未经允许不要批量点。
+
+边界：不要使用别人的 `auths/`；不要把 7866 暴露到公网；不要把 `api_key.txt`
+或 `auths/` 提交回仓库。
+
 ## 快速开始
 
 ```bash
@@ -41,6 +60,18 @@ make linux            # bin/ 下 4 个 Linux 静态二进制
 make windows          # 或 Windows：4 个 exe
 make test
 ```
+
+发布产物目前只有 Windows（四件套 + 一键启动 zip）；Linux 用 `make linux`
+自己编译，或用仓库里的 Dockerfile / docker-compose。
+
+### Windows 一键启动（不装 Go 的人）
+
+1. 从 Releases 下载 `codearts2api-windows.zip`，解压到任意目录（脚本和 `bin\` 在同一层）。
+2. 双击 `start.cmd`：首次自动生成 `config.json` 和 `api_key.txt`（监听
+   `127.0.0.1:7866`），引导华为云登录，隐藏启动网关，并打开面板。
+3. 面板登录密码用 `api_key.txt` 里的 key；客户端地址填 `http://127.0.0.1:7866/v1`。
+
+网关已在运行时，脚本只打开面板；`gw.log` 是隐藏进程的日志。
 
 ### 登录（华为云账号）
 

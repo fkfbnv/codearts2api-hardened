@@ -2,7 +2,14 @@
 
 本文件记录本维护分支相对上游 [HITZY2002/codearts2api](https://github.com/HITZY2002/codearts2api) 的改动。
 
-## 未发布
+## v1.0.2 — 2026-11-17
+
+### 上手体验
+
+- Windows 一键启动 `start.cmd`：首次自动生成 `config.json` 与 `api_key.txt`
+  （监听 `127.0.0.1:7866`），引导华为云登录，隐藏启动网关并打开面板。
+- Release 增加 `codearts2api-windows.zip`：四个 exe + 一键启动脚本 + 示例配置 + 文档。
+- README 增加「给 AI agent 的入口」，列出 clone/编译、配置、登录、验证与边界。
 
 ### 面板
 

@@ -18,6 +18,13 @@ jobs:
           cache: false
       - name: Build Windows binaries
         run: make windows
+      - name: Package Windows bundle
+        run: |
+          zip -r codearts2api-windows.zip \
+            bin/codearts2api.exe bin/codearts2api-login.exe \
+            bin/codearts2api-credit.exe bin/codearts2api-apply.exe \
+            start.cmd start-hidden.vbs scripts/make-config.ps1 \
+            config.example.json README.md CHANGELOG.md LICENSE
       - name: Checksums
         run: |
           cd bin
@@ -27,6 +34,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            codearts2api-windows.zip
             bin/codearts2api.exe
             bin/codearts2api-login.exe
             bin/codearts2api-credit.exe
