@@ -115,12 +115,16 @@ func Default() *Config {
 	c.BenefitAutoClaim = true // 已弃用，仅兼容旧配置文件
 	c.CreditsAutoClaim = true
 
-	// CLI 后端默认开启：直连对 DeepSeek/GLM-5.3/Kimi 等模型已无权，只有 CLI 能用。
-	c.CLIBackend.Enabled = true
+	// CLI 后端默认关闭：直连 + 小写模型 ID + tool_stream 已能调通便宜模型，
+	// CLI（agent 内核）每次带约 1.4 万 token 的 system prompt，更贵且只出纯文本。
+	// 需要时在 config.json 开 cli_backend.enabled 并配好 codearts_exe。
+	c.CLIBackend.Enabled = false
 	c.CLIBackend.Endpoint = "http://127.0.0.1:4096"
 	c.CLIBackend.Provider = "huaweicloud-maas"
 	c.CLIBackend.Agent = "build"
-	c.CLIBackend.CodeartsExe = `C:\Users\liang\.codeartsdoer\installers\bin\codearts.exe`
+	// 官方 CLI 的安装路径因机器而异，默认留空：未配置时 CLI 后端无法启动，
+	// 在 config.json 写 cli_backend.codearts_exe，或设置环境变量 CA2A_CLI_EXE。
+	c.CLIBackend.CodeartsExe = ""
 	c.CLIBackend.CredentialsFile = "./cli-credentials.json"
 	c.CLIBackend.TimeoutSeconds = 300
 	c.CLIBackend.Models = map[string]string{
@@ -287,6 +291,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("CA2A_CATALOG_CACHE_FILE"); v != "" {
 		c.CatalogCacheFile = v
+	}
+	if v := os.Getenv("CA2A_CLI_EXE"); v != "" {
+		c.CLIBackend.CodeartsExe = v
 	}
 }
 

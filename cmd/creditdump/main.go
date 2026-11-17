@@ -3,7 +3,7 @@
 // 用途：核实上游 delivery 返回里每日签到用什么字段标识（type/triggerEvent），
 // 避免签到过滤逻辑依赖会轮换的 campaignId。只做 GET，无写操作。
 //
-// 用法：creditdump -auth-dir E:/网关/codearts2api/auths
+// 用法：creditdump -auth-dir ./auths
 package main
 
 import (

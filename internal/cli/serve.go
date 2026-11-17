@@ -36,6 +36,10 @@ func EnsureServe(ctx context.Context, cfg ServeConfig) error {
 	if ok {
 		return nil
 	}
+	if cfg.Exe == "" {
+		return fmt.Errorf("codearts cli 路径未配置：请在 config.json 写 cli_backend.codearts_exe，" +
+			"或设置环境变量 CA2A_CLI_EXE")
+	}
 	if _, err := os.Stat(cfg.Exe); err != nil {
 		return fmt.Errorf("codearts cli not found at %s: %w", cfg.Exe, err)
 	}

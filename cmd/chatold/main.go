@@ -1,7 +1,7 @@
 // chatold 诊断工具：用官方 IDE 的旧聊天端点 /v1/chat/chat 发一条最小请求，
 // 对比 /api/v2/chat/completions 的模型权限结果（只发一次，消耗 <1 积分）。
 //
-// 用法：chatold -auth-dir E:/网关/codearts2api/auths -model DeepSeek-V4.1-Flash-1017 -user fkfbnv144
+// 用法：chatold -auth-dir ./auths -model GLM-5.2 -user <account-name>
 package main
 
 import (

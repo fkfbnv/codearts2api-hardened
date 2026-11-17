@@ -34,21 +34,21 @@ func makeRefreshToken(t *testing.T, profile map[string]any) string {
 
 func TestIdentityFromRefreshTokenUserProfile(t *testing.T) {
 	tok := makeRefreshToken(t, map[string]any{
-		"account_id":             "01a1487cf8be7e62a4a8b1c02dc68124",
-		"account_name":           "fkfbnv144",
-		"principal_id":           "01a1487cf8be7566979ff14189fb5e2d",
+		"account_id":             "00000000000000000000000000000001",
+		"account_name":           "test-user",
+		"principal_id":           "00000000000000000000000000000002",
 		"principal_is_root_user": true,
-		"principal_urn":          "iam::01a1487cf8be7e62a4a8b1c02dc68124:user:fkfbnv144",
+		"principal_urn":          "iam::00000000000000000000000000000001:user:test-user",
 	})
 
 	id := IdentityFromRefreshToken(tok)
-	if id.UserID != "01a1487cf8be7566979ff14189fb5e2d" {
+	if id.UserID != "00000000000000000000000000000002" {
 		t.Fatalf("user_id = %q", id.UserID)
 	}
-	if id.UserName != "fkfbnv144" {
+	if id.UserName != "test-user" {
 		t.Fatalf("user_name = %q", id.UserName)
 	}
-	if id.DomainID != "01a1487cf8be7e62a4a8b1c02dc68124" {
+	if id.DomainID != "00000000000000000000000000000001" {
 		t.Fatalf("domain_id = %q", id.DomainID)
 	}
 	if id.Empty() {
@@ -104,7 +104,7 @@ func TestIdentityFromTopLevelClaims(t *testing.T) {
 func TestBackfillIdentitiesFillsAndRenames(t *testing.T) {
 	dir := t.TempDir()
 	tok := makeRefreshToken(t, map[string]any{
-		"account_id": "dom-1", "account_name": "fkfbnv144", "principal_id": "pid-1",
+		"account_id": "dom-1", "account_name": "test-user", "principal_id": "pid-1",
 	})
 
 	blank := &Auth{RefreshToken: tok, CloudDragonTok: "tok", AccessKeyID: "AK", SecretAccessKey: "SK"}
@@ -126,7 +126,7 @@ func TestBackfillIdentitiesFillsAndRenames(t *testing.T) {
 	if len(out) != 2 {
 		t.Fatalf("expected 2 accounts, got %d", len(out))
 	}
-	if out[0].UserID != "pid-1" || out[0].UserName != "fkfbnv144" || out[0].DomainID != "dom-1" {
+	if out[0].UserID != "pid-1" || out[0].UserName != "test-user" || out[0].DomainID != "dom-1" {
 		t.Fatalf("blank account not backfilled: %+v", out[0])
 	}
 	if out[1].UserID != "keep-me" || out[1].UserName != "keep-name" {
@@ -145,7 +145,7 @@ func TestBackfillIdentitiesFillsAndRenames(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.UserName != "fkfbnv144" {
+	if got.UserName != "test-user" {
 		t.Fatalf("persisted identity missing: user_id=%q name=%q domain=%q",
 			got.UserID, got.UserName, got.DomainID)
 	}

@@ -51,10 +51,9 @@ type ModelInfo struct {
 }
 
 // 福利（opengw benefit）通道 2026-11-11 起上游整体下线：gateway/config 与
-// benefit/claim 一律 4000 invalid channel（本机日志 + 多个第三方实现交叉印证，
-// 见 E:\修复\码道反代生态调研-20261111.md §二.2）。因此不再做福利发现、不再
-// 维护冷启动福利种子；maas_type 路由机制保留，目录里带 Benefit 标记的条目
-// （历史缓存/显式登记）仍按原样路由。
+// benefit/claim 一律 4000 invalid channel（本机日志与多个第三方实现交叉印证）。
+// 因此不再做福利发现、不再维护冷启动福利种子；maas_type 路由机制保留，
+// 目录里带 Benefit 标记的条目（历史缓存/显式登记）仍按原样路由。
 
 // 内置模型种子（大小写归一用，不标记福利）。
 var seedKnownModels = []string{

@@ -20,8 +20,8 @@ import (
 // 身份其实就在 refresh_token 里：它是 JWT，payload 的 user_profile 字段是
 // base64(JSON)，含 account_id / account_name / principal_id / principal_urn：
 //
-//	{"account_id":"01a1...","account_name":"fkfbnv144",
-//	 "principal_id":"01a1...","principal_urn":"iam::01a1...:user:fkfbnv144"}
+//	{"account_id":"01a1...","account_name":"test-user",
+//	 "principal_id":"01a1...","principal_urn":"iam::01a1...:user:test-user"}
 //
 // 注意 JWT 里**没有** sub claim，所以旧的 identityFromRefreshToken 只能返回空串。
 
