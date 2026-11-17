@@ -38,6 +38,26 @@ func (e *ApiError) Error() string {
 	return fmt.Sprintf("codearts api code=%d http=%d path=%s msg=%s", e.Code, e.Status, e.Path, e.Message)
 }
 
+// DefaultChatBodyLimit 上游 /api/v2/chat/completions 的请求体硬上限。
+//
+// 2026-11-17 实测：10,484,871 字节 → 200；10,485,871 字节 → 400
+// InferHub.001001005（文案是「参数非法」，与体积无关）。边界正好是 10 MiB。
+// 上游把它报成参数错误，网关提前拦截并给出明确原因，避免客户端误判为提示词/模型问题。
+const DefaultChatBodyLimit int64 = 10 << 20
+
+// BodyLimitError 本次发往上游的请求体超过 chat-completions 的硬上限。
+// 换账号、换模型结果相同，不应轮换或冷却账号。
+type BodyLimitError struct {
+	Limit  int64
+	Actual int64
+}
+
+func (e *BodyLimitError) Error() string {
+	return fmt.Sprintf("request body %d bytes exceeds upstream chat limit %d bytes; "+
+		"the upstream reports such requests as InferHub.001001005 (request param invalid). "+
+		"Reduce inline images or history, or start a new session.", e.Actual, e.Limit)
+}
+
 // Credentials 登录返回的 STS 临时凭证。
 type Credentials struct {
 	AccessKeyID     string `json:"access_key_id"`
@@ -115,6 +135,10 @@ type Client struct {
 	heartbeatBase string
 	// chatURL chat-completions 完整地址覆盖（测试注入用，留空走 snapBase）。
 	chatURL string
+
+	// MaxChatBodyBytes 发往 chat-completions 的请求体上限（字节）。
+	// 0 表示用 DefaultChatBodyLimit。账号池在创建 Client 时按配置注入。
+	MaxChatBodyBytes int64
 
 	// 分来源失败退避：同一账号的 builtin/福利接口打不通时短期内不再重试，
 	// 避免每次 /v1/models 刷新都空等超时。
@@ -604,6 +628,15 @@ func isModelIDError(message string) bool {
 // benefit 由调用方按账号判定，maas_type 在签名前写入，计入 SignedHeaders。
 func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, chatID, sessionID, userSessionID string, benefit bool) (io.ReadCloser, error) {
 	raw, _ := json.Marshal(body)
+	// 体积预检必须在 marshal 之后：字节数是上游实际看到的那个，不是 ZCode 原始 body。
+	// 超限不换号、不冷却——上游对同一条请求的任何账号都回同一个 400。
+	limit := c.MaxChatBodyBytes
+	if limit <= 0 {
+		limit = DefaultChatBodyLimit
+	}
+	if int64(len(raw)) > limit {
+		return nil, &BodyLimitError{Limit: limit, Actual: int64(len(raw))}
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatEndpoint(), bytes.NewReader(raw))
 	if err != nil {
 		return nil, err

@@ -60,11 +60,14 @@ type Config struct {
 	ErrThreshold    int
 	ErrCooldown     time.Duration
 	SoftCooldown    time.Duration
-	RefreshSkew     time.Duration        // token 到期前多久自动刷新
-	MaxConcurrent   int                  // 单账号最大并发数（默认 5）
-	KeepaliveWindow time.Duration        // 保活心跳窗口，超过此时间无活动则发送心跳
-	LoginConfig     upstream.LoginConfig // OAuth/refresh 端点；零值使用生产默认
-	CheckinClient   CheckinClient        // 可选活动客户端；nil 使用账号 Client
+	RefreshSkew     time.Duration // token 到期前多久自动刷新
+	MaxConcurrent   int           // 单账号最大并发数（默认 5）
+	KeepaliveWindow time.Duration // 保活心跳窗口，超过此时间无活动则发送心跳
+	// ChatBodyLimitBytes 发往上游 chat-completions 的请求体上限（默认 10MiB）。
+	// 上游超限回 InferHub.001001005（误导性的「参数非法」），网关按此值提前拦截。
+	ChatBodyLimitBytes int64
+	LoginConfig        upstream.LoginConfig // OAuth/refresh 端点；零值使用生产默认
+	CheckinClient      CheckinClient        // 可选活动客户端；nil 使用账号 Client
 }
 
 // Pool 账号池。
@@ -73,6 +76,14 @@ type Pool struct {
 	state    string
 	mu       sync.Mutex
 	accounts []*Account
+}
+
+// newAccountClient 构造账号的上游客户端，并注入 chat 请求体上限。
+// 动态新增账号（WebUI 登录）与热加载都走这里，避免只有启动时的账号带上限。
+func newAccountClient(bodyLimit int64) *upstream.Client {
+	c := upstream.New(120 * time.Second)
+	c.MaxChatBodyBytes = bodyLimit
+	return c
 }
 
 // New 构建池。
@@ -97,6 +108,9 @@ func New(auths []*auth.Auth, cfg Config, stateFile string) (*Pool, error) {
 	if cfg.KeepaliveWindow <= 0 {
 		cfg.KeepaliveWindow = 10 * time.Minute // 10 分钟无活动则保活
 	}
+	if cfg.ChatBodyLimitBytes <= 0 {
+		cfg.ChatBodyLimitBytes = upstream.DefaultChatBodyLimit
+	}
 	if cfg.LoginConfig.ClientID == "" {
 		cfg.LoginConfig = upstream.DefaultLoginConfig()
 	}
@@ -107,7 +121,7 @@ func New(auths []*auth.Auth, cfg Config, stateFile string) (*Pool, error) {
 			UID:               a.UserID,
 			UserName:          a.UserName,
 			Auth:              a,
-			Client:            upstream.New(120 * time.Second),
+			Client:            newAccountClient(cfg.ChatBodyLimitBytes),
 			maxConcurrent:     cfg.MaxConcurrent,
 			keepaliveLastPing: time.Now(),
 		}
@@ -143,7 +157,7 @@ func (p *Pool) AddAccount(a *auth.Auth) *Account {
 		UID:               a.UserID,
 		UserName:          a.UserName,
 		Auth:              a,
-		Client:            upstream.New(120 * time.Second),
+		Client:            newAccountClient(p.cfg.ChatBodyLimitBytes),
 		maxConcurrent:     p.cfg.MaxConcurrent,
 		keepaliveLastPing: time.Now(),
 	}
@@ -294,7 +308,7 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 				UID:               a.UserID,
 				UserName:          a.UserName,
 				Auth:              a,
-				Client:            upstream.New(120 * time.Second),
+				Client:            newAccountClient(p.cfg.ChatBodyLimitBytes),
 				maxConcurrent:     p.cfg.MaxConcurrent,
 				keepaliveLastPing: time.Now(),
 			})

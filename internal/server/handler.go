@@ -1066,6 +1066,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if serr != nil {
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
 			sess.Stop()                       // 心跳会话一并注销
+			var bodyLimit *upstream.BodyLimitError
+			if errors.As(serr, &bodyLimit) {
+				// 本地预检：请求体超过上游 chat-completions 的 10MiB 硬上限。
+				// 上游对这类请求回 400 InferHub.001001005（「参数非法」），换账号/
+				// 换模型结果相同，所以不轮换、不冷却，直接给客户端一个说得清的 413。
+				writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", bodyLimit.Error())
+				return
+			}
 			if isParamInvalidError(serr) {
 				// Client request-param problem: rotating accounts yields the same 400,
 				// and cooling accounts takes down the whole pool for minutes.

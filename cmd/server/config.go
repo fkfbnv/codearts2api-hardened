@@ -52,6 +52,12 @@ type Config struct {
 	// MaxBodyMB 单个 chat 请求体上限（MB，默认 32）。1107 实测 8MB 会在长会话 +
 	// 图片 base64 时 413；前置 nginx/网关承受力不同，故可配。
 	MaxBodyMB int `json:"max_body_mb"`
+	// UpstreamMaxBodyMB 发往上游 chat-completions 的请求体上限（MB，默认 10）。
+	// 2026-11-17 实测上游硬上限正好 10MiB：超过回 400 InferHub.001001005，
+	// 文案是「参数非法」，与体积无关。网关在 marshal 后按此值预检，超限直接回
+	// 413 request_too_large 并说明原因，不再把误导性文案透传给客户端。
+	// 调大不会让上游接受更大的请求，只影响本地拦截线。
+	UpstreamMaxBodyMB int `json:"upstream_max_body_mb"`
 	// SessionHeartbeat 直连路径启用并发会话心跳（默认 true）。上游每账号 3 路
 	// 并发、闸门只认 chat-session/heartbeat 的 busy/idle；不开会话槽位泄漏，
 	// 连发几个请求就撞 TM.00001041。测试环境可显式置 false。
@@ -335,6 +341,9 @@ func (c *Config) normalize() error {
 	if c.MaxBodyMB <= 0 {
 		c.MaxBodyMB = 32
 	}
+	if c.UpstreamMaxBodyMB <= 0 {
+		c.UpstreamMaxBodyMB = 10
+	}
 	// 心跳默认开。必须与 MaxBodyMB 判断彻底分开：这一行曾经被缩进到上面的
 	// `if c.MaxBodyMB <= 0` 块里，写 max_body_mb 就会静默关掉并发闸。
 	if c.SessionHeartbeat == nil {
@@ -362,11 +371,12 @@ func (c *Config) ToPoolConfig() pool.Config {
 		dur = 10 * time.Minute
 	}
 	return pool.Config{
-		ErrThreshold:    c.Cooldown.ErrThresh,
-		ErrCooldown:     c.ErrCooldownDur,
-		SoftCooldown:    c.SoftRateDur,
-		RefreshSkew:     time.Duration(c.Watch.RefreshSkewM) * time.Minute,
-		MaxConcurrent:   c.MaxConcurrent,
-		KeepaliveWindow: dur,
+		ErrThreshold:       c.Cooldown.ErrThresh,
+		ErrCooldown:        c.ErrCooldownDur,
+		SoftCooldown:       c.SoftRateDur,
+		RefreshSkew:        time.Duration(c.Watch.RefreshSkewM) * time.Minute,
+		MaxConcurrent:      c.MaxConcurrent,
+		KeepaliveWindow:    dur,
+		ChatBodyLimitBytes: int64(c.UpstreamMaxBodyMB) << 20,
 	}
 }

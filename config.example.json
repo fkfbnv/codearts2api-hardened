@@ -17,6 +17,7 @@
   "credits_auto_claim": true,    // watchdog 自动领取每日签到/新手活动积分；与模型 Token 福利独立
   // "login_client_id": "codearts-agent",  // WebUI 登录用 OAuth client；留空自动沿用已有账号的取值
   "max_concurrent": 5,           // 单账号最大并发数（默认 5）
+  "upstream_max_body_mb": 10,    // 发往上游 chat-completions 的请求体上限（默认 10；上游实测硬上限 10MiB）
   "keepalive_window": "10m",     // 保活心跳窗口，超过此时间无活动则发送心跳（默认 10m）
   "watch": {
     "enabled": true,
