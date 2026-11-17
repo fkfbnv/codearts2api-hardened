@@ -24,6 +24,9 @@ func TestClassifyUpstreamMessage(t *testing.T) {
 	}{
 		{"codearts error code=InferHub.001001005.400 msg=The request param is invalid", errKindParamInvalid},
 		{"codearts error code=InferHub.001001020.406 msg=model not multimodal", errKindParamInvalid},
+		// 2026-11-15 22:23 实测：关闭思考参数打到「始终思考」模型，上游回 502
+		// ModelArts.81001.400，曾落进 5xx 兜底把整池冷 10 分钟。
+		{"codearts api code=502 http=502 path=/api/v2/chat/completions msg=InferHub.ModelArts.81001.400 该模型始终思考，不支持关闭思考；请使用 low、high 或 max。", errKindParamInvalid},
 		{"codearts error code=TM.000010051 msg=无权调用该模型", errKindModelUnavailable},
 		{"codearts error code=InferHub.APIG.0101.404 msg=The API does not exist or has not been published in the environment", errKindModelUnavailable},
 		{"codearts error code=InferHub.002002009.404 msg=model is not registered", errKindModelUnavailable},
@@ -34,6 +37,10 @@ func TestClassifyUpstreamMessage(t *testing.T) {
 		{"codearts error code=APIG.0301 msg=Incorrect IAM authentication information: decrypt token fail", errKindAuth},
 		{"codearts error code=APIG.0602 msg=token expired", errKindAuth},
 		{"codearts error code=STS5.1806 msg=invalid refresh token: InvalidDPoPHeader", errKindAuthExpired},
+		// 1116 实测：两个大请求卡 61–63 秒，上游回 504 APIG.0203 Backend timeout，
+		// 曾落进 5xx 兜底把单账号池冷 10 分钟。
+		{`codearts api code=504 http=504 path=/api/v2/chat/completions msg={"error_msg":"Backend timeout","error_code":"APIG.0203","request_id":"b10677c3"}`, errKindGatewayTimeout},
+		{"codearts error code=InferHub.APIG.0203.504 msg=Backend timeout", errKindGatewayTimeout},
 		{"dial tcp 10.0.0.1:443: connect: connection refused", errKindUnknown},
 	}
 	for _, tc := range cases {

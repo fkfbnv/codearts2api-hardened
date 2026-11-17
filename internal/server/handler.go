@@ -1082,6 +1082,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					"upstream content moderation rejected this request: "+truncateMsg(serr.Error(), 200))
 				return
 			}
+			if isGatewayTimeoutError(serr) {
+				// 网关后端超时（APIG.0203）：账号健康，只是这次请求上游 60s 没
+				// 出首字节。不冷却账号；多账号时换号再试，单账号直接给 504。
+				h.handleUpstreamError(acct, model, serr) // 只记日志，不动账号
+				if !h.hasFreshCandidate(model, tried) {
+					w.Header().Set("Retry-After", "20")
+					writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_timeout",
+						"upstream gateway backend timeout: "+truncateMsg(serr.Error(), 200))
+					return
+				}
+				continue
+			}
 			lastErr = serr
 			if h.handleUpstreamError(acct, model, serr) {
 				// 模型级错误：还有没试过的健康账号就先换号（多账号时 B 可能
@@ -1156,6 +1168,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					case errKindRateLimit, errKindConcurrentLimit:
 						writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit",
 							"upstream busy: "+truncateMsg(pre.Err.Error(), 200))
+					case errKindGatewayTimeout:
+						w.Header().Set("Retry-After", "20")
+						writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_timeout",
+							"upstream gateway backend timeout: "+truncateMsg(pre.Err.Error(), 200))
 					default:
 						writeOpenAIError(w, http.StatusBadGateway, "upstream_error",
 							truncateMsg(pre.Err.Error(), 300))
@@ -1169,7 +1185,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					markUnusable(acct.UID, model, reason)
 					log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
 				} else if kind, _ := classifyUpstreamError(werr); kind != errKindParamInvalid &&
-					kind != errKindContentModeration && kind != errKindConcurrentLimit {
+					kind != errKindContentModeration && kind != errKindConcurrentLimit &&
+					kind != errKindGatewayTimeout {
 					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 				}
 			} else {
@@ -1187,6 +1204,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
 					"upstream rejected request params: "+truncateMsg(aerr.Error(), 200))
 				return
+			}
+			if isContentModerationError(aerr) {
+				// 与直接上游错误路径保持一致：内容审查是「本次内容被拒」，不是账号
+				// 故障。以前这里只认参数错误，81011 被塞进 lastErr，轮转结束后变成
+				// 503 no_healthy_account，还把整池陪跑冷却。
+				h.handleUpstreamError(acct, model, aerr) // 只记日志，不动账号
+				writeOpenAIError(w, http.StatusBadRequest, "content_filter",
+					"upstream content moderation rejected this request: "+truncateMsg(aerr.Error(), 200))
+				return
+			}
+			if isGatewayTimeoutError(aerr) {
+				// 网关后端超时（APIG.0203）：见流式路径同名分支——不冷却账号，
+				// 没有其它健康账号时直接回 504 让客户端稍后重试。
+				h.handleUpstreamError(acct, model, aerr) // 只记日志，不动账号
+				if !h.hasFreshCandidate(model, tried) {
+					w.Header().Set("Retry-After", "20")
+					writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_timeout",
+						"upstream gateway backend timeout: "+truncateMsg(aerr.Error(), 200))
+					return
+				}
+				continue
 			}
 			lastErr = aerr
 			// 这里以前是「任何聚合错误一律冷却账号」。上游会把模型级错误（未注册 /
@@ -1477,6 +1515,14 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 			acct.Name, truncateMsg(upstreamErrorText(err), 80))
 		return false
 
+	case errKindGatewayTimeout:
+		// 上游网关后端超时（APIG.0203）：账号健康，紧接一个小请求即可 200。
+		// 1116 事故：这类 504 落进 5xx 兜底，单账号池被冷 10 分钟，所有会话
+		// 503 no_healthy_account。这里只记日志，不罚账号、不记模型不可用。
+		log.Printf("upstream gateway timeout (transient, no penalty) account=%s model=%s msg=%s",
+			acct.Name, model, truncateMsg(upstreamErrorText(err), 160))
+		return false
+
 	case errKindRateLimit:
 		h.cfg.Pool.Cooldown(acct.Name, pool.CoolSoft, h.cfg.SoftCooldown, reason)
 		return false
@@ -1504,6 +1550,16 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 func isContentModerationError(err error) bool {
 	kind, _ := classifyUpstreamError(err)
 	return kind == errKindContentModeration
+}
+
+// isGatewayTimeoutError 判断是否为上游网关的后端超时（APIG.0203 Backend timeout）。
+//
+// 1116 实测：两个 800+ 消息的大请求分别卡了 61–63 秒，上游网关回 504
+// APIG.0203，反代按 5xx 兜底把单账号池冷 10 分钟，两条会话 11 次重试全 503。
+// 账号本身健康——冷却到期后同一个模型小请求 2.1s 就 200。
+func isGatewayTimeoutError(err error) bool {
+	kind, _ := classifyUpstreamError(err)
+	return kind == errKindGatewayTimeout
 }
 
 // isParamInvalidError 判断是否为上游「请求参数/能力不匹配」类错误

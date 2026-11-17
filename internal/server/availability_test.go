@@ -26,6 +26,9 @@ func TestUpstreamUnavailableReason(t *testing.T) {
 		{`codearts api code=502 http=502 path=/api/v2/chat/completions msg=InferHub.APIG.0101.404 The API does not exist or has not been published in the environment`, "上游网关"},
 		// 内容审查拒绝不是「模型不可用」——换话题就能用，不能记进可用性缓存。
 		{`codearts api code=502 http=502 msg=InferHub.ModelArts.81011.403 抱歉，我无法提供关于您提问内容的建议。`, ""},
+		// 「始终思考」模型拒绝关闭思考：请求形状问题，不是模型不可用
+		// （否则 /v1/models 会误下架一个本来能用的模型）。
+		{`codearts api code=502 http=502 msg=InferHub.ModelArts.81001.400 该模型始终思考，不支持关闭思考；请使用 low、high 或 max。`, ""},
 	}
 	for _, c := range cases {
 		got := upstreamUnavailableReason(errors.New(c.msg))
@@ -250,6 +253,39 @@ func TestContentModerationDoesNotPunishAccount(t *testing.T) {
 	}
 	if !p.Healthy("u-mod") {
 		t.Error("连续内容审查拒绝累计后仍不得冷却账号")
+	}
+}
+
+// 1116 事故回归：上游网关 504 APIG.0203 Backend timeout 是瞬时错误，账号健康，
+// 不得冷却。修复前它落进 `Status >= 500` 兜底，单账号池被冷 10 分钟，
+// 所有会话 503 no_healthy_account；冷却到期后同一模型小请求 2.1s 即 200。
+func TestGatewayTimeoutDoesNotCoolAccount(t *testing.T) {
+	a := &auth.Auth{UserID: "u-to", UserName: "u-to", AccessKeyID: "AK", SecretAccessKey: "SK", CloudDragonTok: "ST"}
+	p, err := pool.New([]*auth.Auth{a}, pool.Config{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second), ErrCooldown: time.Minute, ErrThreshold: 1})
+
+	timeout := &upstream.ApiError{
+		Code: 504, Status: 504, Path: "/api/v2/chat/completions",
+		Message: `Backend timeout (error_code APIG.0203)`,
+	}
+	if h.handleUpstreamError(p.Get("u-to"), "deepseek-v4.1-flash-1017", timeout) {
+		t.Error("网关超时不该返回 true（会下架模型）")
+	}
+	if !p.Healthy("u-to") {
+		t.Fatal("网关后端超时不得冷却账号")
+	}
+	if st, _ := modelAvailability("u-to", "deepseek-v4.1-flash-1017"); st == availUnusable {
+		t.Error("网关超时不得把模型记成不可用")
+	}
+	// 阈值 1 的前提下连续超时多次也不能触发错误累计冷却。
+	for i := 0; i < 3; i++ {
+		h.handleUpstreamError(p.Get("u-to"), "deepseek-v4.1-flash-1017", timeout)
+	}
+	if !p.Healthy("u-to") {
+		t.Error("连续网关超时累计后仍不得冷却账号")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -182,6 +183,11 @@ const (
 	errKindConcurrentLimit
 	// errKindRateLimit 429 / 模型级限流。
 	errKindRateLimit
+	// errKindGatewayTimeout 上游 API 网关的后端超时（APIG.0203 Backend timeout）。
+	// 网关等后端超过其阈值（实测约 60s）就回 504，与账号健康无关：同一账号
+	// 紧接着发一个小请求照样 200。1116 实测两个 800+ 消息的大请求撞上 60s，
+	// 落到 5xx 兜底把单账号池冷 10 分钟，所有会话 503 no_healthy_account。
+	errKindGatewayTimeout
 	// errKindServer 真正的上游 5xx。
 	errKindServer
 )
@@ -202,6 +208,8 @@ func (k upstreamErrorKind) String() string {
 		return "concurrent_limit"
 	case errKindRateLimit:
 		return "rate_limit"
+	case errKindGatewayTimeout:
+		return "gateway_timeout"
 	case errKindServer:
 		return "server"
 	}
@@ -252,7 +260,17 @@ func upstreamErrorText(err error) string {
 
 // classifyUpstreamError 把错误分类成 (类别, 人类可读原因)。
 func classifyUpstreamError(err error) (upstreamErrorKind, string) {
-	return classifyUpstreamMessage(upstreamErrorText(err))
+	if kind, reason := classifyUpstreamMessage(upstreamErrorText(err)); kind != errKindUnknown {
+		return kind, reason
+	}
+	// 文本里没有专门判据时按 HTTP 状态码兜底：裸 504（上游网关后端超时）
+	// 同样是瞬时错误，不能落进 5xx 冷却分支。1116 事故的 504 正文恰好带
+	// APIG.0203，但上游换一种包装就不能再靠字符串碰运气。
+	var ae *upstream.ApiError
+	if errors.As(err, &ae) && ae.Status == http.StatusGatewayTimeout {
+		return errKindGatewayTimeout, "上游网关后端超时（HTTP 504，瞬时，稍后重试）"
+	}
+	return errKindUnknown, ""
 }
 
 // classifyUpstreamMessage 对一段上游错误文本分类。判据顺序即优先级：
@@ -274,6 +292,12 @@ func classifyUpstreamMessage(msg string) (upstreamErrorKind, string) {
 		return errKindParamInvalid, "上游判定请求参数非法（InferHub.001001005）"
 	case containsCode(low, "001001020") || strings.Contains(low, "multimodal"):
 		return errKindParamInvalid, "该模型不支持本次消息形态（多模态不匹配，InferHub.001001020）"
+	// 「始终思考」的模型收到关闭思考参数：上游包成 502
+	// （ModelArts.81001.400），但它只是请求形状问题，换账号结果相同。
+	// 2026-11-15 22:23 这个 502 落进 5xx 兜底分支，把单账号池冷 10 分钟。
+	case strings.Contains(low, "modelarts.81001") || strings.Contains(low, "始终思考") ||
+		strings.Contains(low, "不支持关闭思考"):
+		return errKindParamInvalid, "模型不支持关闭思考（reasoning_effort 需用 low/high/max）"
 
 	// --- 模型级不可用：不罚账号，记「账号×模型」 ---
 	// 上游 #11：无权类错误集合比逐个错误码更全（含大小写变体），放最前；
@@ -292,6 +316,12 @@ func classifyUpstreamMessage(msg string) (upstreamErrorKind, string) {
 	// --- 并发/排队：瞬时 ---
 	case containsCode(low, "00001041") || strings.Contains(low, "并发会话"):
 		return errKindConcurrentLimit, "上游并发会话已达上限（瞬时，可重试）"
+
+	// --- 网关后端超时：瞬时，与账号无关 ---
+	// APIG.0203 = 上游网关等后端响应超时（实测约 60s 掐断）。账号本身健康，
+	// 紧接一个小请求即可 200，绝不能把账号扔进 10 分钟冷却。
+	case containsCode(low, "apig.0203") || strings.Contains(low, "backend timeout"):
+		return errKindGatewayTimeout, "上游网关后端超时（APIG.0203，瞬时，稍后重试）"
 
 	// --- 限流 ---
 	case strings.Contains(low, "modelarts.81111.429") || strings.Contains(low, "tpm limit") ||

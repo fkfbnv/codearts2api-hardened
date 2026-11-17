@@ -148,15 +148,14 @@ func TestChatCompletionsParamInvalidDoesNotRotateOrCoolAccounts(t *testing.T) {
 				for i := 0; i < 3; i++ {
 					rec := httptest.NewRecorder()
 					h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload)))
+					// late_sse 只多了角色帧、没有任何正文：仍属于预流错误，必须回真
+					// 状态码而不是 200 + SSE error（角色帧不再提前写出）。
 					wantStatus := http.StatusBadRequest
-					if kind == "late_sse" && stream {
-						wantStatus = http.StatusOK // The stream headers were already sent.
-						if !strings.Contains(rec.Body.String(), "event: error") || !strings.Contains(rec.Body.String(), "data: [DONE]") {
-							t.Fatalf("late error did not terminate the stream: %s", rec.Body.String())
-						}
-					}
 					if rec.Code != wantStatus || !strings.Contains(rec.Body.String(), "InferHub.001001005") {
 						t.Fatalf("status=%d want=%d body=%s", rec.Code, wantStatus, rec.Body.String())
+					}
+					if strings.Contains(rec.Body.String(), "event: error") {
+						t.Fatalf("pre-stream business error must not be an SSE error event: %s", rec.Body.String())
 					}
 					if attempts.Load() != int32(i+1) {
 						t.Fatalf("parameter error rotated or retried accounts: attempts=%d requests=%d", attempts.Load(), i+1)

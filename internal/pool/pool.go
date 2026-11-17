@@ -402,16 +402,32 @@ func (p *Pool) NoteError(name string, threshold int, cooldown time.Duration) {
 	p.saveState()
 }
 
-// NoteSuccess 清零错误计数。
+// NoteSuccess 清零错误计数，并清掉成功请求已证明失效的旧错误文本与冷却。
+//
+// 以前只清内存里的 errCount：lastErr / coolUntil 留在 state.json 里，重启后
+// 面板仍显示早已失效的冷却和错误原因。成功调用本身就是「账号当前可用」的
+// 最强证据，所以旧冷却一并失效。只改这些运行态字段，绝不动 disabled /
+// disabledReason。
 func (p *Pool) NoteSuccess(name string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	changed := false
 	for _, a := range p.accounts {
-		if a.Name == name {
-			a.mu.Lock()
-			a.errCount = 0
-			a.mu.Unlock()
+		if a.Name != name {
+			continue
 		}
+		a.mu.Lock()
+		if a.errCount != 0 || a.lastErr != "" || !a.coolUntil.IsZero() || a.coolKind != CoolSoft {
+			changed = true
+		}
+		a.errCount = 0
+		a.lastErr = ""
+		a.coolUntil = time.Time{}
+		a.coolKind = CoolSoft // 与 ClearCooldown 保持同一套归零约定
+		a.mu.Unlock()
+	}
+	if changed {
+		p.saveState() // 与 NoteError/Cooldown 一致：调用方已持有 p.mu
 	}
 }
 
